@@ -1,0 +1,28 @@
+{
+  "id": "/",
+  "name": "Codex Relay Console",
+  "short_name": "Codex Relay",
+  "description": "Installable relay console for live Codex sessions, permissions, and session history.",
+  "lang": "en-US",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui", "browser"],
+  "background_color": "#f4f1ea",
+  "theme_color": "#1f2a1d",
+  "categories": ["developer", "productivity"],
+  "icons": [
+    {
+      "src": "/icons/app.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/app-maskable.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ]
+}

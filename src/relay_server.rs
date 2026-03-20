@@ -174,6 +174,11 @@ pub async fn run(config: RelayServerConfig) -> Result<()> {
     let state = AppState::new(config.clone())?;
     let app = Router::new()
         .route("/", get(debug_console))
+        .route("/manifest.webmanifest", get(web_manifest))
+        .route("/sw.js", get(service_worker))
+        .route("/favicon.svg", get(app_icon))
+        .route("/icons/app.svg", get(app_icon))
+        .route("/icons/app-maskable.svg", get(app_maskable_icon))
         .route("/healthz", get(healthz))
         .route("/ws/client", get(client_ws_handler))
         .route("/ws/browser", get(browser_ws_handler))
@@ -201,8 +206,52 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-async fn debug_console() -> Html<&'static str> {
-    Html(include_str!("relay_console.html"))
+async fn debug_console() -> impl IntoResponse {
+    (
+        [("cache-control", "no-cache")],
+        Html(include_str!("relay_console.html")),
+    )
+}
+
+async fn web_manifest() -> impl IntoResponse {
+    (
+        [
+            ("content-type", "application/manifest+json; charset=utf-8"),
+            ("cache-control", "no-cache"),
+        ],
+        include_str!("pwa_manifest.webmanifest"),
+    )
+}
+
+async fn service_worker() -> impl IntoResponse {
+    (
+        [
+            ("content-type", "application/javascript; charset=utf-8"),
+            ("cache-control", "no-cache"),
+            ("service-worker-allowed", "/"),
+        ],
+        include_str!("pwa_service_worker.js"),
+    )
+}
+
+async fn app_icon() -> impl IntoResponse {
+    (
+        [
+            ("content-type", "image/svg+xml"),
+            ("cache-control", "no-cache"),
+        ],
+        include_str!("pwa_icon.svg"),
+    )
+}
+
+async fn app_maskable_icon() -> impl IntoResponse {
+    (
+        [
+            ("content-type", "image/svg+xml"),
+            ("cache-control", "no-cache"),
+        ],
+        include_str!("pwa_icon_maskable.svg"),
+    )
 }
 
 async fn client_ws_handler(
@@ -529,7 +578,10 @@ async fn handle_client_message(
             route_session_message(
                 state,
                 &session_id,
-                ServerToBrowserMessage::OutputChunk { session_id, text },
+                ServerToBrowserMessage::OutputChunk {
+                    session_id: session_id.clone(),
+                    text,
+                },
             )
             .await?;
         }
@@ -563,7 +615,7 @@ async fn handle_client_message(
                 state,
                 &session_id,
                 ServerToBrowserMessage::PromptFinished {
-                    session_id,
+                    session_id: session_id.clone(),
                     stop_reason,
                 },
             )
@@ -1031,7 +1083,7 @@ async fn cleanup_browser(state: &AppState, browser_id: &str) {
 
 async fn cleanup_device(state: &AppState, device_id: &str) {
     let affected_browser_ids = {
-        let mut sessions = state.inner.sessions.lock().await;
+        let sessions = state.inner.sessions.lock().await;
         let affected_browser_ids = sessions
             .values()
             .filter(|session| session.device_id == device_id)

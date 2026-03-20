@@ -3,6 +3,17 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Installable relay console for live Codex sessions, permissions, and session history."
+    />
+    <meta name="theme-color" content="#1f2a1d" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Codex Relay" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/icons/app.svg" />
     <title>Codex Relay Console</title>
     <style>
       :root {
@@ -22,6 +33,7 @@
 
       body {
         margin: 0;
+        min-height: 100vh;
         font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
         color: var(--ink);
         background:
@@ -33,14 +45,17 @@
       .shell {
         max-width: 1200px;
         margin: 0 auto;
-        padding: 32px 20px 48px;
+        padding:
+          calc(32px + env(safe-area-inset-top))
+          20px
+          calc(48px + env(safe-area-inset-bottom));
       }
 
       .hero {
         display: flex;
         justify-content: space-between;
         gap: 20px;
-        align-items: end;
+        align-items: flex-start;
         margin-bottom: 20px;
       }
 
@@ -56,6 +71,44 @@
         color: var(--muted);
         font-size: 1rem;
         line-height: 1.45;
+      }
+
+      .hero-actions {
+        display: grid;
+        gap: 12px;
+        justify-items: end;
+        max-width: 320px;
+      }
+
+      .badge-row {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: end;
+        gap: 8px;
+      }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 8px 12px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.55);
+        color: var(--muted);
+        font-size: 0.8rem;
+        letter-spacing: 0.02em;
+      }
+
+      .badge-live {
+        background: var(--accent-soft);
+        border-color: rgba(45, 106, 79, 0.28);
+        color: var(--accent);
+      }
+
+      .badge-warn {
+        background: rgba(164, 74, 63, 0.08);
+        border-color: rgba(164, 74, 63, 0.28);
+        color: var(--warning);
       }
 
       .grid {
@@ -126,6 +179,7 @@
         border: 1px solid transparent;
         background: var(--accent);
         color: #f8faf7;
+        touch-action: manipulation;
         transition: transform 120ms ease, opacity 120ms ease;
       }
 
@@ -227,6 +281,15 @@
         .hero {
           display: block;
         }
+
+        .hero-actions {
+          justify-items: start;
+          margin-top: 16px;
+        }
+
+        .badge-row {
+          justify-content: start;
+        }
       }
     </style>
   </head>
@@ -236,15 +299,31 @@
         <div>
           <h1>Codex Relay Console</h1>
           <p class="sub">
-            A minimal browser console for the relay server. It speaks the same
-            browser websocket protocol the future PWA will use, so we can verify
-            session routing before building the polished app shell.
+            Installable PWA shell for the relay server. Use it in a browser tab,
+            pin it to your dock or home screen, and keep the console chrome
+            available even when the network drops for a moment.
+          </p>
+        </div>
+        <div class="hero-actions">
+          <div class="badge-row">
+            <span class="badge" id="appModeBadge">Browser Tab</span>
+            <span class="badge" id="networkBadge">Online</span>
+          </div>
+          <p class="sub" id="appLead">
+            The live relay connection still depends on your server and home
+            client, but the app shell now behaves like a real installable app.
           </p>
         </div>
       </div>
 
       <div class="grid">
         <div class="stack">
+          <section class="card section">
+            <h2>App Shell</h2>
+            <button id="installBtn" class="secondary" disabled>Install App</button>
+            <p class="hint" id="appStatus">Checking install and offline support...</p>
+          </section>
+
           <section class="card section">
             <h2>Connection</h2>
             <div class="row">
@@ -322,6 +401,11 @@
         permissions: new Map(),
       };
 
+      const pwaState = {
+        deferredInstallEvent: null,
+        serviceWorkerReady: false,
+      };
+
       const deviceList = document.getElementById("deviceList");
       const deviceSelect = document.getElementById("deviceSelect");
       const sessionList = document.getElementById("sessionList");
@@ -329,6 +413,10 @@
       const sessionStatus = document.getElementById("sessionStatus");
       const stream = document.getElementById("stream");
       const permissionList = document.getElementById("permissionList");
+      const installBtn = document.getElementById("installBtn");
+      const appStatus = document.getElementById("appStatus");
+      const appModeBadge = document.getElementById("appModeBadge");
+      const networkBadge = document.getElementById("networkBadge");
 
       const connectBtn = document.getElementById("connectBtn");
       const disconnectBtn = document.getElementById("disconnectBtn");
@@ -340,6 +428,9 @@
       const clearOutputBtn = document.getElementById("clearOutputBtn");
       const cwdInput = document.getElementById("cwdInput");
       const promptInput = document.getElementById("promptInput");
+      const displayModeMedia = window.matchMedia
+        ? window.matchMedia("(display-mode: standalone)")
+        : null;
 
       function wsUrl() {
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -356,6 +447,91 @@
 
       function setConnectionStatus(text) {
         connectionStatus.textContent = text;
+      }
+
+      function isStandaloneMode() {
+        return Boolean(displayModeMedia && displayModeMedia.matches) || window.navigator.standalone === true;
+      }
+
+      function updateBadges() {
+        const standalone = isStandaloneMode();
+        appModeBadge.textContent = standalone ? "Standalone App" : "Browser Tab";
+        appModeBadge.className = `badge${standalone ? " badge-live" : ""}`;
+
+        const online = navigator.onLine;
+        networkBadge.textContent = online ? "Online" : "Offline";
+        networkBadge.className = `badge ${online ? "badge-live" : "badge-warn"}`;
+
+        document.body.classList.toggle("standalone", standalone);
+      }
+
+      function updateAppStatus(message = null) {
+        const standalone = isStandaloneMode();
+        const installReady = Boolean(pwaState.deferredInstallEvent);
+
+        installBtn.hidden = standalone;
+        installBtn.disabled = standalone || !installReady;
+
+        if (message) {
+          appStatus.textContent = message;
+          return;
+        }
+
+        if (standalone) {
+          appStatus.textContent = pwaState.serviceWorkerReady
+            ? "Installed app ready. The shell is cached for offline launches and reconnects when your relay comes back."
+            : "Installed app running. Offline shell support is still initializing.";
+          return;
+        }
+
+        if (!("serviceWorker" in navigator)) {
+          appStatus.textContent =
+            "This browser can open the console, but it does not support the offline app shell.";
+          return;
+        }
+
+        if (installReady) {
+          appStatus.textContent =
+            "Installable app ready. Use Install App for a dedicated standalone window with the cached app shell.";
+          return;
+        }
+
+        appStatus.textContent = pwaState.serviceWorkerReady
+          ? "App shell cached. Keep using the browser tab now, and install from your browser menu when supported."
+          : "Preparing the offline app shell for this browser.";
+      }
+
+      async function registerServiceWorker() {
+        if (!("serviceWorker" in navigator)) {
+          updateAppStatus();
+          return;
+        }
+
+        try {
+          const registration = await navigator.serviceWorker.register("/sw.js");
+          pwaState.serviceWorkerReady = true;
+          updateAppStatus();
+
+          if (registration.waiting) {
+            appendOutput("[pwa] app shell update ready; reload to activate it", "meta");
+          }
+
+          registration.addEventListener("updatefound", () => {
+            appendOutput("[pwa] downloading app shell update", "meta");
+          });
+        } catch (error) {
+          pwaState.serviceWorkerReady = false;
+          updateAppStatus("App shell registration failed in this browser.");
+          appendOutput(
+            `[pwa] service worker registration failed: ${error.message}`,
+            "error"
+          );
+        }
+      }
+
+      function refreshPwaChrome() {
+        updateBadges();
+        updateAppStatus();
       }
 
       function renderDevices() {
@@ -664,6 +840,48 @@
         stream.innerHTML = "";
       });
 
+      installBtn.addEventListener("click", async () => {
+        const installEvent = pwaState.deferredInstallEvent;
+        if (!installEvent) {
+          return;
+        }
+
+        pwaState.deferredInstallEvent = null;
+        installBtn.disabled = true;
+        installEvent.prompt();
+        const choice = await installEvent.userChoice;
+        appendOutput(`[pwa] install prompt ${choice.outcome}`, "meta");
+        updateAppStatus(choice.outcome === "accepted" ? "Installing app..." : null);
+      });
+
+      window.addEventListener("beforeinstallprompt", (event) => {
+        event.preventDefault();
+        pwaState.deferredInstallEvent = event;
+        updateAppStatus();
+      });
+
+      window.addEventListener("appinstalled", () => {
+        pwaState.deferredInstallEvent = null;
+        refreshPwaChrome();
+        updateAppStatus(
+          "App installed. Launch it from your home screen, dock, or app launcher."
+        );
+        appendOutput("[pwa] app installed", "meta");
+      });
+
+      window.addEventListener("online", refreshPwaChrome);
+      window.addEventListener("offline", refreshPwaChrome);
+
+      if (displayModeMedia) {
+        if (typeof displayModeMedia.addEventListener === "function") {
+          displayModeMedia.addEventListener("change", refreshPwaChrome);
+        } else if (typeof displayModeMedia.addListener === "function") {
+          displayModeMedia.addListener(refreshPwaChrome);
+        }
+      }
+
+      refreshPwaChrome();
+      registerServiceWorker();
       connect();
     </script>
   </body>

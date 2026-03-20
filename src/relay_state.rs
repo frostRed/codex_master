@@ -82,7 +82,7 @@ impl SessionEventExt for SessionEventMessage {
 }
 
 fn compact_events(events: &[SessionEventMessage]) -> Vec<SessionEventMessage> {
-    let mut compacted = Vec::new();
+    let mut compacted: Vec<SessionEventMessage> = Vec::new();
 
     for event in events {
         if let Some(previous) = compacted.last_mut()

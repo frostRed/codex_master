@@ -198,9 +198,10 @@ pub async fn run_home_client<T: ClientTransport>(mut transport: T) -> Result<()>
     );
     let agent = Rc::new(agent);
 
+    let runtime_error_tx = internal_tx.clone();
     tokio::task::spawn_local(async move {
         if let Err(err) = io_task.await {
-            let _ = internal_tx.send(InternalEvent::RuntimeError {
+            let _ = runtime_error_tx.send(InternalEvent::RuntimeError {
                 message: format!("acp-io 错误: {err}"),
             });
         }

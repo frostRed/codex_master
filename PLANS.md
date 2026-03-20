@@ -163,3 +163,34 @@
   - missing an event creation path when introducing monotonic sequencing
   - incorrect de-duplication when loading checkpointed history plus log tail
   - over-compacting history in ways that make browser debugging harder
+
+## 2026-03-20 Formal PWA For Relay Console
+
+- Goal: turn the relay browser console into an installable PWA with explicit app metadata, app-shell caching, and mobile-friendly standalone behavior.
+- Scope:
+  - keep the existing single-file browser console architecture
+  - serve PWA assets directly from the Rust relay server without adding a frontend build pipeline
+  - add a web app manifest, service worker, and app icons
+  - update the HTML shell to register the service worker and expose install/state cues
+- Invariants:
+  - the relay console remains reachable at `/`
+  - WebSocket protocol and relay session behavior do not change
+  - server-side changes are limited to static asset delivery for the browser shell
+  - PWA assets should version cleanly enough to pick up future shell updates
+- Likely files/modules to change:
+  - `PLANS.md`
+  - `src/relay_server.rs`
+  - `src/relay_console.html`
+  - `src/pwa_manifest.webmanifest`
+  - `src/pwa_service_worker.js`
+  - `src/pwa_icon.svg`
+  - `src/pwa_icon_maskable.svg`
+- Verification steps:
+  - run `cargo fmt`
+  - run `cargo check`
+  - confirm the relay server exposes the manifest, service worker, and icon routes
+  - review the HTML for service worker registration and install-path behavior
+- Main risks:
+  - caching the shell too aggressively and making updates look stale
+  - shipping icons or manifest metadata that install poorly on some platforms
+  - adding PWA UX that assumes browser support the current environment may not have
