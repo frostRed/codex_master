@@ -1,6 +1,8 @@
-use crate::config::RelayTransportConfig;
-use crate::protocol::{ClientToServerMessage, PermissionOptionMessage, ServerToClientMessage};
-use crate::types::{HomeClientCommand, HomeClientEvent};
+use crate::config::{RelayTransportConfig, WorkspaceConfig};
+use crate::protocol::{
+    ClientToServerMessage, PermissionOptionMessage, ServerToClientMessage, WorkspaceSummaryMessage,
+};
+use crate::types::{HomeClientCommand, HomeClientEvent, WorkspaceView};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -23,6 +25,7 @@ struct LocalDebugState {
     active_session: Option<String>,
     pending_permission_requests: HashMap<String, usize>,
     active_stream_session: Option<String>,
+    available_workspaces: Vec<WorkspaceView>,
 }
 
 pub struct LocalDebugTransport {
@@ -82,16 +85,25 @@ impl ClientTransport for LocalDebugTransport {
 
     async fn publish_event(&mut self, event: HomeClientEvent) -> Result<()> {
         match event {
-            HomeClientEvent::Ready { agent_name } => {
+            HomeClientEvent::Ready {
+                agent_name,
+                workspaces,
+            } => {
+                self.state.borrow_mut().available_workspaces = workspaces.clone();
                 println!("已连接 {agent_name}。输入 /help 查看命令。");
+                print_workspaces(&workspaces);
             }
             HomeClientEvent::Info { message } => {
                 println!("[info] {message}");
             }
-            HomeClientEvent::SessionCreated { session_id, cwd } => {
+            HomeClientEvent::SessionCreated {
+                session_id,
+                workspace_id,
+                workspace_name,
+            } => {
                 let mut state = self.state.borrow_mut();
                 state.active_session = Some(session_id.clone());
-                println!("[session] {session_id} cwd={}", cwd.display());
+                println!("[session] {session_id} workspace={workspace_name} ({workspace_id})");
             }
             HomeClientEvent::OutputChunk { session_id, text } => {
                 let mut state = self.state.borrow_mut();
@@ -165,11 +177,17 @@ fn parse_command(
         return Ok(None);
     }
 
+    if trimmed == "/workspaces" {
+        let workspaces = state.borrow().available_workspaces.clone();
+        print_workspaces(&workspaces);
+        return Ok(None);
+    }
+
     if let Some(rest) = trimmed.strip_prefix("/new") {
-        let cwd = parse_optional_arg(rest).map(Into::into);
+        let workspace_id = parse_optional_arg(rest).map(str::to_string);
         return Ok(Some(HomeClientCommand::CreateSession {
             session_id: None,
-            cwd,
+            workspace_id,
         }));
     }
 
@@ -233,11 +251,27 @@ fn parse_optional_arg(rest: &str) -> Option<&str> {
 
 fn print_help() {
     println!("命令:");
-    println!("  /new [cwd]              创建新会话，可选指定工作目录");
+    println!("  /new [workspace_id]     创建新会话，可选指定工作区");
+    println!("  /workspaces             查看当前允许的工作区");
     println!("  /use <session_id>       切换当前活跃会话");
     println!("  /perm <id> <index>      响应权限请求");
     println!("  /exit                   退出");
     println!("  其他任意文本会发送到当前会话；若没有会话则自动创建。");
+}
+
+fn print_workspaces(workspaces: &[WorkspaceView]) {
+    if workspaces.is_empty() {
+        println!("[info] 当前没有可用工作区。");
+        return;
+    }
+
+    println!("工作区:");
+    for workspace in workspaces {
+        println!(
+            "  - {} ({})",
+            workspace.workspace_name, workspace.workspace_id
+        );
+    }
 }
 
 enum RelayOutbound {
@@ -251,7 +285,10 @@ pub struct RelayTransport {
 }
 
 impl RelayTransport {
-    pub async fn connect(config: RelayTransportConfig) -> Result<Self> {
+    pub async fn connect(
+        config: RelayTransportConfig,
+        workspaces: Vec<WorkspaceConfig>,
+    ) -> Result<Self> {
         let (ws_stream, _) = connect_async(&config.url)
             .await
             .with_context(|| format!("连接 relay 失败: {}", config.url))?;
@@ -345,6 +382,13 @@ impl RelayTransport {
                     "prompt-stream".to_string(),
                     "permission-roundtrip".to_string(),
                 ],
+                workspaces: workspaces
+                    .into_iter()
+                    .map(|workspace| WorkspaceSummaryMessage {
+                        workspace_id: workspace.id,
+                        workspace_name: workspace.name,
+                    })
+                    .collect(),
                 auth_token: config.auth_token,
             }))
             .map_err(|_| anyhow!("relay outbound channel 已关闭"))?;
@@ -373,12 +417,13 @@ impl ClientTransport for RelayTransport {
 
 fn map_server_message(message: ServerToClientMessage) -> Option<HomeClientCommand> {
     match message {
-        ServerToClientMessage::CreateSession { session_id, cwd } => {
-            Some(HomeClientCommand::CreateSession {
-                session_id: Some(session_id),
-                cwd: cwd.map(Into::into),
-            })
-        }
+        ServerToClientMessage::CreateSession {
+            session_id,
+            workspace_id,
+        } => Some(HomeClientCommand::CreateSession {
+            session_id: Some(session_id),
+            workspace_id: Some(workspace_id),
+        }),
         ServerToClientMessage::Prompt {
             session_id,
             text,
@@ -402,14 +447,17 @@ fn map_server_message(message: ServerToClientMessage) -> Option<HomeClientComman
 
 fn map_home_event(event: HomeClientEvent) -> ClientToServerMessage {
     match event {
-        HomeClientEvent::Ready { agent_name } => ClientToServerMessage::Ready { agent_name },
+        HomeClientEvent::Ready { agent_name, .. } => ClientToServerMessage::Ready { agent_name },
         HomeClientEvent::Info { message } => ClientToServerMessage::Info { message },
-        HomeClientEvent::SessionCreated { session_id, cwd } => {
-            ClientToServerMessage::SessionCreated {
-                session_id,
-                cwd: cwd.display().to_string(),
-            }
-        }
+        HomeClientEvent::SessionCreated {
+            session_id,
+            workspace_id,
+            workspace_name,
+        } => ClientToServerMessage::SessionCreated {
+            session_id,
+            workspace_id,
+            workspace_name,
+        },
         HomeClientEvent::OutputChunk { session_id, text } => {
             ClientToServerMessage::OutputChunk { session_id, text }
         }

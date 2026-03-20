@@ -9,17 +9,27 @@ async fn main() -> Result<()> {
     tokio::task::LocalSet::new()
         .run_until(async {
             let config = AppConfig::from_env()?;
+            let workspaces = config.workspaces.clone();
+            let default_workspace_id = config.default_workspace_id.clone();
             match config.transport {
                 TransportConfig::Local => {
                     let transport = LocalDebugTransport::new();
-                    runtime::run_home_client(transport).await
+                    runtime::run_home_client(transport, workspaces, default_workspace_id).await
                 }
                 TransportConfig::Relay(relay_config) => {
                     let reconnect_delay = Duration::from_secs(relay_config.reconnect_delay_secs);
                     loop {
-                        match RelayTransport::connect(relay_config.clone()).await {
+                        match RelayTransport::connect(relay_config.clone(), workspaces.clone())
+                            .await
+                        {
                             Ok(transport) => {
-                                if let Err(err) = runtime::run_home_client(transport).await {
+                                if let Err(err) = runtime::run_home_client(
+                                    transport,
+                                    workspaces.clone(),
+                                    default_workspace_id.clone(),
+                                )
+                                .await
+                                {
                                     eprintln!("[relay-runtime-error] {err}");
                                 } else {
                                     eprintln!("[relay-runtime] connection ended");

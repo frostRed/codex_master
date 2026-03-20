@@ -344,8 +344,8 @@
             <label for="deviceSelect">Target device</label>
             <select id="deviceSelect"></select>
 
-            <label for="cwdInput">Working directory override</label>
-            <input id="cwdInput" placeholder="/optional/path" />
+            <label for="workspaceSelect">Allowed workspace</label>
+            <select id="workspaceSelect"></select>
 
             <div class="row" style="margin-top: 12px">
               <button id="newSessionBtn">Create Session</button>
@@ -408,6 +408,7 @@
 
       const deviceList = document.getElementById("deviceList");
       const deviceSelect = document.getElementById("deviceSelect");
+      const workspaceSelect = document.getElementById("workspaceSelect");
       const sessionList = document.getElementById("sessionList");
       const connectionStatus = document.getElementById("connectionStatus");
       const sessionStatus = document.getElementById("sessionStatus");
@@ -426,7 +427,6 @@
       const sendPromptBtn = document.getElementById("sendPromptBtn");
       const olderHistoryBtn = document.getElementById("olderHistoryBtn");
       const clearOutputBtn = document.getElementById("clearOutputBtn");
-      const cwdInput = document.getElementById("cwdInput");
       const promptInput = document.getElementById("promptInput");
       const displayModeMedia = window.matchMedia
         ? window.matchMedia("(display-mode: standalone)")
@@ -534,10 +534,68 @@
         updateAppStatus();
       }
 
+      function describeWorkspace(workspace) {
+        if (!workspace) {
+          return "Unknown workspace";
+        }
+        return `${workspace.workspace_name} (${workspace.workspace_id})`;
+      }
+
+      function describeSession(session) {
+        if (!session) {
+          return "No relay session yet.";
+        }
+        const workspace = session.workspace_name
+          ? `${session.workspace_name} (${session.workspace_id ?? "unknown"})`
+          : "unknown workspace";
+        return `Session ${session.session_id} on ${session.device_id} in ${workspace}`;
+      }
+
+      function renderWorkspaceSelect() {
+        const selectedDevice = state.devices.get(deviceSelect.value);
+        const previousWorkspaceId = workspaceSelect.value;
+        workspaceSelect.innerHTML = "";
+
+        if (!selectedDevice) {
+          const empty = document.createElement("option");
+          empty.value = "";
+          empty.textContent = "Choose a device first";
+          workspaceSelect.appendChild(empty);
+          return;
+        }
+
+        const workspaces = Array.isArray(selectedDevice.workspaces)
+          ? selectedDevice.workspaces
+          : [];
+
+        if (workspaces.length === 0) {
+          const empty = document.createElement("option");
+          empty.value = "";
+          empty.textContent = "No allowed workspaces";
+          workspaceSelect.appendChild(empty);
+          return;
+        }
+
+        for (const workspace of workspaces) {
+          const option = document.createElement("option");
+          option.value = workspace.workspace_id;
+          option.textContent = describeWorkspace(workspace);
+          workspaceSelect.appendChild(option);
+        }
+
+        const keepPrevious = workspaces.some(
+          (workspace) => workspace.workspace_id === previousWorkspaceId
+        );
+        workspaceSelect.value = keepPrevious
+          ? previousWorkspaceId
+          : workspaces[0].workspace_id;
+      }
+
       function renderDevices() {
         const devices = Array.from(state.devices.values()).sort((a, b) =>
           a.device_name.localeCompare(b.device_name)
         );
+        const previousDeviceId = deviceSelect.value;
 
         deviceList.innerHTML = "";
         deviceSelect.innerHTML = "";
@@ -548,15 +606,20 @@
           empty.textContent = "No devices";
           empty.value = "";
           deviceSelect.appendChild(empty);
+          renderWorkspaceSelect();
           return;
         }
 
         for (const device of devices) {
+          const workspaceNames = (device.workspaces ?? []).map(
+            (workspace) => workspace.workspace_name
+          );
           const item = document.createElement("div");
           item.className = "device-item";
           item.innerHTML = `
             <strong>${device.device_name}</strong>
             <div>${device.device_id}</div>
+            <div>workspaces: ${workspaceNames.join(", ") || "none published"}</div>
             <div class="status">
               <span class="dot ${device.connected ? "live" : ""}"></span>
               ${device.connected ? "Online" : "Offline"}
@@ -570,6 +633,15 @@
           if (!device.connected) option.disabled = true;
           deviceSelect.appendChild(option);
         }
+
+        const connectedDevices = devices.filter((device) => device.connected);
+        const keepPrevious = connectedDevices.some(
+          (device) => device.device_id === previousDeviceId
+        );
+        deviceSelect.value = keepPrevious
+          ? previousDeviceId
+          : connectedDevices[0]?.device_id ?? devices[0].device_id;
+        renderWorkspaceSelect();
       }
 
       function renderPermissions() {
@@ -630,7 +702,7 @@
             <strong>${session.session_id}</strong>
             <div>device: ${session.device_id}</div>
             <div>status: ${session.status}</div>
-            <div>cwd: ${session.cwd ?? "(unknown)"}</div>
+            <div>workspace: ${session.workspace_name ?? "(unknown)"} (${session.workspace_id ?? "unknown"})</div>
           `;
 
           const row = document.createElement("div");
@@ -641,7 +713,7 @@
           adoptButton.textContent = "Adopt";
           adoptButton.addEventListener("click", () => {
             state.currentSessionId = session.session_id;
-            sessionStatus.textContent = `Session ${session.session_id} on ${session.device_id}`;
+            sessionStatus.textContent = describeSession(session);
             send({ type: "adopt_session", session_id: session.session_id });
             state.historyCursor = null;
             state.historyHasMore = false;
@@ -653,7 +725,7 @@
           historyButton.textContent = "History";
           historyButton.addEventListener("click", () => {
             state.currentSessionId = session.session_id;
-            sessionStatus.textContent = `Session ${session.session_id} on ${session.device_id}`;
+            sessionStatus.textContent = describeSession(session);
             send({ type: "adopt_session", session_id: session.session_id });
             requestHistory(session.session_id, null);
           });
@@ -745,9 +817,11 @@
               state.historyCursor = null;
               state.historyHasMore = false;
               state.lastHistoryBeforeSeq = null;
-              sessionStatus.textContent = `Session ${message.session_id} on ${message.device_id}`;
+              sessionStatus.textContent =
+                `Session ${message.session_id} on ${message.device_id} in ` +
+                `${message.workspace_name} (${message.workspace_id})`;
               appendOutput(
-                `[session] created ${message.session_id} cwd=${message.cwd}`,
+                `[session] created ${message.session_id} workspace=${message.workspace_name} (${message.workspace_id})`,
                 "meta"
               );
               send({ type: "list_sessions" });
@@ -791,6 +865,10 @@
         send({ type: "list_devices" });
       });
 
+      deviceSelect.addEventListener("change", () => {
+        renderWorkspaceSelect();
+      });
+
       refreshSessionsBtn.addEventListener("click", () => {
         send({ type: "list_sessions" });
       });
@@ -801,10 +879,15 @@
           appendOutput("[browser] choose a live device first", "error");
           return;
         }
+        const workspaceId = workspaceSelect.value;
+        if (!workspaceId) {
+          appendOutput("[browser] choose an allowed workspace first", "error");
+          return;
+        }
         send({
           type: "create_session",
           device_id: deviceId,
-          cwd: cwdInput.value.trim() || null,
+          workspace_id: workspaceId,
         });
       });
 

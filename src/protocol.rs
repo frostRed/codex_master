@@ -8,6 +8,12 @@ pub struct PermissionOptionMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSummaryMessage {
+    pub workspace_id: String,
+    pub workspace_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientToServerMessage {
     Hello {
@@ -15,6 +21,7 @@ pub enum ClientToServerMessage {
         device_name: String,
         client_version: String,
         capabilities: Vec<String>,
+        workspaces: Vec<WorkspaceSummaryMessage>,
         auth_token: String,
     },
     Ready {
@@ -25,7 +32,8 @@ pub enum ClientToServerMessage {
     },
     SessionCreated {
         session_id: String,
-        cwd: String,
+        workspace_id: String,
+        workspace_name: String,
     },
     OutputChunk {
         session_id: String,
@@ -50,7 +58,7 @@ pub enum ClientToServerMessage {
 pub enum ServerToClientMessage {
     CreateSession {
         session_id: String,
-        cwd: Option<String>,
+        workspace_id: String,
     },
     Prompt {
         session_id: Option<String>,
@@ -70,6 +78,8 @@ pub struct DeviceStatusMessage {
     pub device_id: String,
     pub device_name: String,
     pub connected: bool,
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceSummaryMessage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,7 +87,12 @@ pub struct RelaySessionSummaryMessage {
     pub session_id: String,
     pub device_id: String,
     pub status: String,
-    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_user_id: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub workspace_name: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -104,7 +119,7 @@ pub enum BrowserToServerMessage {
     ListSessions,
     CreateSession {
         device_id: String,
-        cwd: Option<String>,
+        workspace_id: String,
     },
     AdoptSession {
         session_id: String,
@@ -146,7 +161,8 @@ pub enum ServerToBrowserMessage {
     SessionCreated {
         session_id: String,
         device_id: String,
-        cwd: String,
+        workspace_id: String,
+        workspace_name: String,
     },
     OutputChunk {
         session_id: String,

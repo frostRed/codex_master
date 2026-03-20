@@ -1,6 +1,6 @@
 use crate::protocol::{
     BrowserToServerMessage, ClientToServerMessage, DeviceStatusMessage, RelaySessionSummaryMessage,
-    ServerToBrowserMessage, ServerToClientMessage, SessionEventMessage,
+    ServerToBrowserMessage, ServerToClientMessage, SessionEventMessage, WorkspaceSummaryMessage,
 };
 use crate::relay_state::{RelayPersistence, RelayStore, SessionEventExt, unix_timestamp_secs};
 use anyhow::{Context, Result, anyhow};
@@ -10,8 +10,9 @@ use axum::{
         State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
+    http::{HeaderMap, StatusCode},
     response::Html,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -33,6 +34,10 @@ use tokio::{
 pub struct RelayServerConfig {
     pub bind_addr: SocketAddr,
     pub expected_client_token: Option<String>,
+    pub browser_auth_required: bool,
+    pub browser_auth_user_header: String,
+    pub browser_auth_proxy_secret: Option<String>,
+    pub browser_auth_proxy_secret_header: String,
     pub state_file: PathBuf,
     pub compaction_threshold: usize,
     pub segment_event_limit: usize,
@@ -45,6 +50,18 @@ impl RelayServerConfig {
             .parse()
             .context("解析 RELAY_SERVER_BIND 失败")?;
         let expected_client_token = std::env::var("RELAY_SERVER_CLIENT_TOKEN").ok();
+        let browser_auth_required = std::env::var("RELAY_SERVER_BROWSER_AUTH_REQUIRED")
+            .ok()
+            .map(|value| parse_bool_env("RELAY_SERVER_BROWSER_AUTH_REQUIRED", &value))
+            .transpose()?
+            .unwrap_or(false);
+        let browser_auth_user_header = std::env::var("RELAY_SERVER_BROWSER_AUTH_USER_HEADER")
+            .unwrap_or_else(|_| "X-Relay-User".to_string());
+        let browser_auth_proxy_secret =
+            std::env::var("RELAY_SERVER_BROWSER_AUTH_PROXY_SECRET").ok();
+        let browser_auth_proxy_secret_header =
+            std::env::var("RELAY_SERVER_BROWSER_AUTH_PROXY_SECRET_HEADER")
+                .unwrap_or_else(|_| "X-Relay-Auth-Secret".to_string());
         let state_file = std::env::var("RELAY_SERVER_STATE_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("relay-state.json"));
@@ -59,6 +76,10 @@ impl RelayServerConfig {
         Ok(Self {
             bind_addr,
             expected_client_token,
+            browser_auth_required,
+            browser_auth_user_header,
+            browser_auth_proxy_secret,
+            browser_auth_proxy_secret_header,
             state_file,
             compaction_threshold,
             segment_event_limit,
@@ -73,6 +94,7 @@ struct AppState {
 
 struct InnerState {
     expected_client_token: Option<String>,
+    browser_auth: BrowserAuthConfig,
     persistence: RelayPersistence,
     next_browser_id: AtomicU64,
     next_session_id: AtomicU64,
@@ -86,8 +108,6 @@ struct InnerState {
 
 #[derive(Clone)]
 struct DeviceConnection {
-    device_id: String,
-    device_name: String,
     sender: mpsc::UnboundedSender<Message>,
 }
 
@@ -101,6 +121,7 @@ struct RelaySession {
     session_id: String,
     device_id: String,
     browser_id: String,
+    owner_user_id: String,
 }
 
 #[derive(Clone)]
@@ -108,6 +129,19 @@ struct PendingPermission {
     session_id: Option<String>,
     device_id: String,
     browser_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct BrowserAuthConfig {
+    required: bool,
+    user_header: String,
+    expected_proxy_secret: Option<String>,
+    proxy_secret_header: String,
+}
+
+#[derive(Debug, Clone)]
+struct AuthenticatedBrowser {
+    user_id: String,
 }
 
 impl AppState {
@@ -123,6 +157,12 @@ impl AppState {
         Ok(Self {
             inner: Arc::new(InnerState {
                 expected_client_token: config.expected_client_token,
+                browser_auth: BrowserAuthConfig {
+                    required: config.browser_auth_required,
+                    user_header: config.browser_auth_user_header,
+                    expected_proxy_secret: config.browser_auth_proxy_secret,
+                    proxy_secret_header: config.browser_auth_proxy_secret_header,
+                },
                 persistence,
                 next_browser_id: AtomicU64::new(1),
                 next_session_id: AtomicU64::new(next_session_counter),
@@ -140,6 +180,10 @@ impl AppState {
                                     session_id: session.session_id.clone(),
                                     device_id: session.device_id.clone(),
                                     browser_id: String::new(),
+                                    owner_user_id: session
+                                        .owner_user_id
+                                        .clone()
+                                        .unwrap_or_default(),
                                 },
                             )
                         })
@@ -206,14 +250,23 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-async fn debug_console() -> impl IntoResponse {
+async fn debug_console(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(response) = ensure_browser_http_auth(&state, &headers) {
+        return response;
+    }
+
     (
         [("cache-control", "no-cache")],
         Html(include_str!("relay_console.html")),
     )
+        .into_response()
 }
 
-async fn web_manifest() -> impl IntoResponse {
+async fn web_manifest(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(response) = ensure_browser_http_auth(&state, &headers) {
+        return response;
+    }
+
     (
         [
             ("content-type", "application/manifest+json; charset=utf-8"),
@@ -221,9 +274,14 @@ async fn web_manifest() -> impl IntoResponse {
         ],
         include_str!("pwa_manifest.webmanifest"),
     )
+        .into_response()
 }
 
-async fn service_worker() -> impl IntoResponse {
+async fn service_worker(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(response) = ensure_browser_http_auth(&state, &headers) {
+        return response;
+    }
+
     (
         [
             ("content-type", "application/javascript; charset=utf-8"),
@@ -232,9 +290,14 @@ async fn service_worker() -> impl IntoResponse {
         ],
         include_str!("pwa_service_worker.js"),
     )
+        .into_response()
 }
 
-async fn app_icon() -> impl IntoResponse {
+async fn app_icon(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(response) = ensure_browser_http_auth(&state, &headers) {
+        return response;
+    }
+
     (
         [
             ("content-type", "image/svg+xml"),
@@ -242,9 +305,14 @@ async fn app_icon() -> impl IntoResponse {
         ],
         include_str!("pwa_icon.svg"),
     )
+        .into_response()
 }
 
-async fn app_maskable_icon() -> impl IntoResponse {
+async fn app_maskable_icon(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(response) = ensure_browser_http_auth(&state, &headers) {
+        return response;
+    }
+
     (
         [
             ("content-type", "image/svg+xml"),
@@ -252,6 +320,7 @@ async fn app_maskable_icon() -> impl IntoResponse {
         ],
         include_str!("pwa_icon_maskable.svg"),
     )
+        .into_response()
 }
 
 async fn client_ws_handler(
@@ -263,9 +332,15 @@ async fn client_ws_handler(
 
 async fn browser_ws_handler(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_browser_socket(state, socket))
+    let browser = match authenticate_browser_request(&state, &headers) {
+        Ok(browser) => browser,
+        Err(response) => return response,
+    };
+
+    ws.on_upgrade(move |socket| handle_browser_socket(state, socket, browser))
 }
 
 async fn handle_client_socket(state: AppState, socket: WebSocket) {
@@ -281,7 +356,7 @@ async fn handle_client_socket(state: AppState, socket: WebSocket) {
     });
 
     let hello = read_client_hello(&mut ws_receiver).await;
-    let (device_id, device_name, auth_token) = match hello {
+    let (device_id, device_name, workspaces, auth_token) = match hello {
         Ok(values) => values,
         Err(err) => {
             let _ = tx.send(text_message(&ServerToBrowserMessage::Error {
@@ -303,17 +378,11 @@ async fn handle_client_socket(state: AppState, socket: WebSocket) {
 
     {
         let mut devices = state.inner.devices.lock().await;
-        devices.insert(
-            device_id.clone(),
-            DeviceConnection {
-                device_id: device_id.clone(),
-                device_name: device_name.clone(),
-                sender: tx.clone(),
-            },
-        );
+        devices.insert(device_id.clone(), DeviceConnection { sender: tx.clone() });
     }
     let device_id_for_store = device_id.clone();
     let device_name_for_store = device_name.clone();
+    let workspaces_for_store = workspaces.clone();
     if let Err(err) = update_store(&state, |store| {
         store.devices.insert(
             device_id_for_store.clone(),
@@ -321,6 +390,7 @@ async fn handle_client_socket(state: AppState, socket: WebSocket) {
                 device_id: device_id_for_store.clone(),
                 device_name: device_name_for_store.clone(),
                 connected: true,
+                workspaces: workspaces_for_store.clone(),
             },
         );
     })
@@ -334,6 +404,7 @@ async fn handle_client_socket(state: AppState, socket: WebSocket) {
             device_id: device_id.clone(),
             device_name: device_name.clone(),
             connected: true,
+            workspaces: workspaces.clone(),
         },
     )
     .await;
@@ -366,6 +437,7 @@ async fn handle_client_socket(state: AppState, socket: WebSocket) {
     }
     let device_id_for_store = device_id.clone();
     let device_name_for_store = device_name.clone();
+    let workspaces_for_store = workspaces.clone();
     if let Err(err) = update_store(&state, |store| {
         store.devices.insert(
             device_id_for_store.clone(),
@@ -373,6 +445,7 @@ async fn handle_client_socket(state: AppState, socket: WebSocket) {
                 device_id: device_id_for_store.clone(),
                 device_name: device_name_for_store.clone(),
                 connected: false,
+                workspaces: workspaces_for_store.clone(),
             },
         );
     })
@@ -387,13 +460,14 @@ async fn handle_client_socket(state: AppState, socket: WebSocket) {
             device_id,
             device_name,
             connected: false,
+            workspaces,
         },
     )
     .await;
     writer.abort();
 }
 
-async fn handle_browser_socket(state: AppState, socket: WebSocket) {
+async fn handle_browser_socket(state: AppState, socket: WebSocket, browser: AuthenticatedBrowser) {
     let browser_id = state.next_browser_id();
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -414,13 +488,18 @@ async fn handle_browser_socket(state: AppState, socket: WebSocket) {
     if let Err(err) = send_device_list(&state, &browser_id).await {
         eprintln!("[relay-browser-init-error] {err}");
     }
+    if let Err(err) = send_session_list(&state, &browser_id, &browser.user_id).await {
+        eprintln!("[relay-browser-init-error] {err}");
+    }
 
     while let Some(result) = ws_receiver.next().await {
         match result {
             Ok(Message::Text(text)) => {
                 match serde_json::from_str::<BrowserToServerMessage>(text.as_ref()) {
                     Ok(message) => {
-                        if let Err(err) = handle_browser_message(&state, &browser_id, message).await
+                        if let Err(err) =
+                            handle_browser_message(&state, &browser_id, &browser.user_id, message)
+                                .await
                         {
                             let _ = send_to_browser(
                                 &state,
@@ -465,7 +544,7 @@ async fn handle_browser_socket(state: AppState, socket: WebSocket) {
 
 async fn read_client_hello(
     ws_receiver: &mut futures_util::stream::SplitStream<WebSocket>,
-) -> Result<(String, String, String)> {
+) -> Result<(String, String, Vec<WorkspaceSummaryMessage>, String)> {
     while let Some(result) = ws_receiver.next().await {
         match result {
             Ok(Message::Text(text)) => {
@@ -474,11 +553,12 @@ async fn read_client_hello(
                 if let ClientToServerMessage::Hello {
                     device_id,
                     device_name,
+                    workspaces,
                     auth_token,
                     ..
                 } = message
                 {
-                    return Ok((device_id, device_name, auth_token));
+                    return Ok((device_id, device_name, workspaces, auth_token));
                 }
 
                 return Err(anyhow!("client 第一个消息必须是 hello"));
@@ -510,15 +590,21 @@ async fn handle_client_message(
         ClientToServerMessage::Info { message } => {
             broadcast_info(state, format!("device {device_id}: {message}")).await;
         }
-        ClientToServerMessage::SessionCreated { session_id, cwd } => {
+        ClientToServerMessage::SessionCreated {
+            session_id,
+            workspace_id,
+            workspace_name,
+        } => {
             let now = unix_timestamp_secs();
             let seq = state.next_event_seq();
             let session_id_for_store = session_id.clone();
-            let cwd_for_store = cwd.clone();
+            let workspace_id_for_store = workspace_id.clone();
+            let workspace_name_for_store = workspace_name.clone();
             update_store(state, |store| {
                 if let Some(summary) = store.sessions.get_mut(&session_id_for_store) {
                     summary.status = "ready".to_string();
-                    summary.cwd = Some(cwd_for_store.clone());
+                    summary.workspace_id = Some(workspace_id_for_store.clone());
+                    summary.workspace_name = Some(workspace_name_for_store.clone());
                     summary.updated_at = now;
                 }
                 store.events.push(SessionEventMessage {
@@ -527,7 +613,10 @@ async fn handle_client_message(
                     session_id: session_id_for_store.clone(),
                     timestamp: now,
                     kind: "session_created".to_string(),
-                    text: Some(cwd_for_store.clone()),
+                    text: Some(format!(
+                        "{} ({})",
+                        workspace_name_for_store, workspace_id_for_store
+                    )),
                     stop_reason: None,
                     request_id: None,
                     options: None,
@@ -547,7 +636,8 @@ async fn handle_client_message(
                     ServerToBrowserMessage::SessionCreated {
                         session_id,
                         device_id: session.device_id,
-                        cwd,
+                        workspace_id,
+                        workspace_name,
                     },
                 )
                 .await?;
@@ -698,19 +788,27 @@ async fn handle_client_message(
 async fn handle_browser_message(
     state: &AppState,
     browser_id: &str,
+    browser_user_id: &str,
     message: BrowserToServerMessage,
 ) -> Result<()> {
     match message {
         BrowserToServerMessage::ListDevices => send_device_list(state, browser_id).await?,
-        BrowserToServerMessage::ListSessions => send_session_list(state, browser_id).await?,
-        BrowserToServerMessage::CreateSession { device_id, cwd } => {
+        BrowserToServerMessage::ListSessions => {
+            send_session_list(state, browser_id, browser_user_id).await?
+        }
+        BrowserToServerMessage::CreateSession {
+            device_id,
+            workspace_id,
+        } => {
             ensure_device_connected(state, &device_id).await?;
+            let workspace = resolve_device_workspace(state, &device_id, &workspace_id).await?;
             let session_id = state.next_session_id();
             let now = unix_timestamp_secs();
             let seq = state.next_event_seq();
             let session_id_for_store = session_id.clone();
             let device_id_for_store = device_id.clone();
-            let cwd_for_store = cwd.clone();
+            let workspace_id_for_store = workspace.workspace_id.clone();
+            let workspace_name_for_store = workspace.workspace_name.clone();
 
             {
                 let mut sessions = state.inner.sessions.lock().await;
@@ -720,6 +818,7 @@ async fn handle_browser_message(
                         session_id: session_id.clone(),
                         device_id: device_id.clone(),
                         browser_id: browser_id.to_string(),
+                        owner_user_id: browser_user_id.to_string(),
                     },
                 );
             }
@@ -730,7 +829,9 @@ async fn handle_browser_message(
                         session_id: session_id_for_store.clone(),
                         device_id: device_id_for_store.clone(),
                         status: "requested".to_string(),
-                        cwd: cwd_for_store.clone(),
+                        owner_user_id: Some(browser_user_id.to_string()),
+                        workspace_id: Some(workspace_id_for_store.clone()),
+                        workspace_name: Some(workspace_name_for_store.clone()),
                         created_at: now,
                         updated_at: now,
                     },
@@ -752,22 +853,46 @@ async fn handle_browser_message(
             send_to_client(
                 state,
                 &device_id,
-                ServerToClientMessage::CreateSession { session_id, cwd },
+                ServerToClientMessage::CreateSession {
+                    session_id,
+                    workspace_id,
+                },
             )
             .await?;
         }
         BrowserToServerMessage::AdoptSession { session_id } => {
+            let mut claimed_legacy_owner = false;
             {
                 let mut sessions = state.inner.sessions.lock().await;
                 let session = sessions
                     .get_mut(&session_id)
                     .ok_or_else(|| anyhow!("未知 relay session: {session_id}"))?;
+                if !session_owned_by_user_id(&session.owner_user_id, browser_user_id) {
+                    return Err(anyhow!("当前用户无权访问该 session"));
+                }
                 session.browser_id = browser_id.to_string();
+                if session.owner_user_id.is_empty() {
+                    session.owner_user_id = browser_user_id.to_string();
+                    claimed_legacy_owner = true;
+                }
             }
-            send_session_list(state, browser_id).await?;
+
+            if claimed_legacy_owner {
+                let session_id_for_store = session_id.clone();
+                let browser_user_id_for_store = browser_user_id.to_string();
+                update_store(state, |store| {
+                    if let Some(summary) = store.sessions.get_mut(&session_id_for_store) {
+                        summary.owner_user_id = Some(browser_user_id_for_store.clone());
+                    }
+                })
+                .await?;
+            }
+
+            send_session_list(state, browser_id, browser_user_id).await?;
         }
         BrowserToServerMessage::Prompt { session_id, text } => {
-            let session = get_browser_session(state, browser_id, &session_id).await?;
+            let session =
+                get_browser_session(state, browser_id, browser_user_id, &session_id).await?;
             let now = unix_timestamp_secs();
             let seq = state.next_event_seq();
             let session_id_for_store = session.session_id.clone();
@@ -808,8 +933,12 @@ async fn handle_browser_message(
         } => {
             let (events, next_before_seq, has_more) = {
                 let store = state.inner.store.lock().await;
-                if !store.sessions.contains_key(&session_id) {
-                    return Err(anyhow!("未知 relay session: {session_id}"));
+                let summary = store
+                    .sessions
+                    .get(&session_id)
+                    .ok_or_else(|| anyhow!("未知 relay session: {session_id}"))?;
+                if !session_summary_visible_to_user(summary, browser_user_id) {
+                    return Err(anyhow!("当前用户无权访问该 session"));
                 }
                 paginate_session_events(&store, &session_id, before_seq, limit)
             };
@@ -903,10 +1032,19 @@ async fn send_device_list(state: &AppState, browser_id: &str) -> Result<()> {
     .await
 }
 
-async fn send_session_list(state: &AppState, browser_id: &str) -> Result<()> {
+async fn send_session_list(
+    state: &AppState,
+    browser_id: &str,
+    browser_user_id: &str,
+) -> Result<()> {
     let sessions = {
         let store = state.inner.store.lock().await;
-        let mut sessions = store.sessions.values().cloned().collect::<Vec<_>>();
+        let mut sessions = store
+            .sessions
+            .values()
+            .filter(|session| session_summary_visible_to_user(session, browser_user_id))
+            .cloned()
+            .collect::<Vec<_>>();
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         sessions
     };
@@ -1053,9 +1191,28 @@ async fn ensure_device_connected(state: &AppState, device_id: &str) -> Result<()
     }
 }
 
+async fn resolve_device_workspace(
+    state: &AppState,
+    device_id: &str,
+    workspace_id: &str,
+) -> Result<WorkspaceSummaryMessage> {
+    let store = state.inner.store.lock().await;
+    let device = store
+        .devices
+        .get(device_id)
+        .ok_or_else(|| anyhow!("未知 device: {device_id}"))?;
+    device
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == workspace_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("device `{device_id}` 不存在 workspace `{workspace_id}`"))
+}
+
 async fn get_browser_session(
     state: &AppState,
     browser_id: &str,
+    browser_user_id: &str,
     session_id: &str,
 ) -> Result<RelaySession> {
     let sessions = state.inner.sessions.lock().await;
@@ -1063,6 +1220,9 @@ async fn get_browser_session(
         .get(session_id)
         .cloned()
         .ok_or_else(|| anyhow!("未知 relay session: {session_id}"))?;
+    if !session_owned_by_user_id(&session.owner_user_id, browser_user_id) {
+        return Err(anyhow!("当前用户无权访问该 session"));
+    }
     if session.browser_id != browser_id {
         return Err(anyhow!("当前 browser 无权访问该 session"));
     }
@@ -1150,6 +1310,78 @@ fn text_message<T: serde::Serialize>(message: &T) -> Message {
             .into(),
         ),
     }
+}
+
+fn session_summary_visible_to_user(
+    session: &RelaySessionSummaryMessage,
+    browser_user_id: &str,
+) -> bool {
+    session_owned_by_user_id(
+        session.owner_user_id.as_deref().unwrap_or_default(),
+        browser_user_id,
+    )
+}
+
+fn session_owned_by_user_id(owner_user_id: &str, browser_user_id: &str) -> bool {
+    owner_user_id.is_empty() || owner_user_id == browser_user_id
+}
+
+fn parse_bool_env(key: &str, value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(anyhow!("{key} 必须是布尔值")),
+    }
+}
+
+fn authenticate_browser_request(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> std::result::Result<AuthenticatedBrowser, Response> {
+    let auth = &state.inner.browser_auth;
+    if !auth.required {
+        return Ok(AuthenticatedBrowser {
+            user_id: "anonymous".to_string(),
+        });
+    }
+
+    if let Some(expected_proxy_secret) = auth.expected_proxy_secret.as_deref() {
+        let provided_secret = header_value(headers, &auth.proxy_secret_header);
+        if provided_secret.as_deref() != Some(expected_proxy_secret) {
+            return Err(unauthorized_response(
+                "browser auth proxy secret missing or invalid",
+            ));
+        }
+    }
+
+    let Some(user_id) = header_value(headers, &auth.user_header) else {
+        return Err(unauthorized_response("browser user header missing"));
+    };
+    if user_id.trim().is_empty() {
+        return Err(unauthorized_response("browser user header empty"));
+    }
+
+    Ok(AuthenticatedBrowser { user_id })
+}
+
+fn ensure_browser_http_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> std::result::Result<AuthenticatedBrowser, Response> {
+    authenticate_browser_request(state, headers)
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn unauthorized_response(message: &str) -> Response {
+    (StatusCode::UNAUTHORIZED, message.to_string()).into_response()
 }
 
 async fn update_store<F>(state: &AppState, mutate: F) -> Result<()>

@@ -1,0 +1,18 @@
+{
+    email {$ACME_EMAIL}
+}
+
+relay.example.com {
+    handle /healthz* {
+        reverse_proxy 127.0.0.1:8080
+    }
+
+    basic_auth {
+        {$RELAY_BASIC_AUTH_USER} {$RELAY_BASIC_AUTH_PASSWORD_HASH}
+    }
+
+    reverse_proxy 127.0.0.1:8080 {
+        header_up X-Relay-User {http.auth.user.id}
+        header_up X-Relay-Auth-Secret {$RELAY_BROWSER_PROXY_SECRET}
+    }
+}

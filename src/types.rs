@@ -1,10 +1,14 @@
-use std::path::PathBuf;
+#[derive(Debug, Clone)]
+pub struct WorkspaceView {
+    pub workspace_id: String,
+    pub workspace_name: String,
+}
 
 #[derive(Debug, Clone)]
 pub enum HomeClientCommand {
     CreateSession {
         session_id: Option<String>,
-        cwd: Option<PathBuf>,
+        workspace_id: Option<String>,
     },
     Prompt {
         session_id: Option<String>,
@@ -29,13 +33,15 @@ pub struct PermissionOptionView {
 pub enum HomeClientEvent {
     Ready {
         agent_name: String,
+        workspaces: Vec<WorkspaceView>,
     },
     Info {
         message: String,
     },
     SessionCreated {
         session_id: String,
-        cwd: PathBuf,
+        workspace_id: String,
+        workspace_name: String,
     },
     OutputChunk {
         session_id: String,

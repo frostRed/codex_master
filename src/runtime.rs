@@ -1,5 +1,6 @@
+use crate::config::WorkspaceConfig;
 use crate::transport::ClientTransport;
-use crate::types::{HomeClientCommand, HomeClientEvent, PermissionOptionView};
+use crate::types::{HomeClientCommand, HomeClientEvent, PermissionOptionView, WorkspaceView};
 use agent_client_protocol::{
     Agent, Client, ClientSideConnection, ContentBlock, Implementation, InitializeRequest,
     NewSessionRequest, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
@@ -9,7 +10,6 @@ use agent_client_protocol::{
 use anyhow::{Context, Result};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::rc::Rc;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -168,8 +168,11 @@ impl Client for RuntimeClient {
     }
 }
 
-pub async fn run_home_client<T: ClientTransport>(mut transport: T) -> Result<()> {
-    let default_cwd = std::env::current_dir().context("无法获取当前工作目录")?;
+pub async fn run_home_client<T: ClientTransport>(
+    mut transport: T,
+    workspaces: Vec<WorkspaceConfig>,
+    default_workspace_id: String,
+) -> Result<()> {
     let codex_acp_bin = std::env::var("CODEX_ACP_BIN").unwrap_or_else(|_| "codex-acp".to_string());
 
     let mut child = Command::new(&codex_acp_bin)
@@ -223,7 +226,16 @@ pub async fn run_home_client<T: ClientTransport>(mut transport: T) -> Result<()>
         .to_string();
 
     transport
-        .publish_event(HomeClientEvent::Ready { agent_name })
+        .publish_event(HomeClientEvent::Ready {
+            agent_name,
+            workspaces: workspaces
+                .iter()
+                .map(|workspace| WorkspaceView {
+                    workspace_id: workspace.id.clone(),
+                    workspace_name: workspace.name.clone(),
+                })
+                .collect(),
+        })
         .await?;
     transport
         .publish_event(HomeClientEvent::Info {
@@ -243,7 +255,8 @@ pub async fn run_home_client<T: ClientTransport>(mut transport: T) -> Result<()>
 
                 if !handle_command(
                     &mut transport,
-                    &default_cwd,
+                    &workspaces,
+                    &default_workspace_id,
                     agent.clone(),
                     runtime_client.clone(),
                     internal_tx.clone(),
@@ -272,7 +285,8 @@ pub async fn run_home_client<T: ClientTransport>(mut transport: T) -> Result<()>
 
 async fn handle_command<T: ClientTransport>(
     transport: &mut T,
-    default_cwd: &Path,
+    workspaces: &[WorkspaceConfig],
+    default_workspace_id: &str,
     agent: Rc<ClientSideConnection>,
     runtime_client: RuntimeClient,
     internal_tx: mpsc::UnboundedSender<InternalEvent>,
@@ -281,15 +295,23 @@ async fn handle_command<T: ClientTransport>(
     command: HomeClientCommand,
 ) -> Result<bool> {
     match command {
-        HomeClientCommand::CreateSession { session_id, cwd } => {
-            let cwd = resolve_cwd(default_cwd, cwd);
-            let acp_session_id = create_session(agent.as_ref(), &cwd).await?;
+        HomeClientCommand::CreateSession {
+            session_id,
+            workspace_id,
+        } => {
+            let workspace = resolve_workspace(
+                workspaces,
+                workspace_id.as_deref(),
+                Some(default_workspace_id),
+            )?;
+            let acp_session_id = create_session(agent.as_ref(), workspace).await?;
             let session_ref = session_id.unwrap_or_else(|| acp_session_id.to_string());
             sessions.insert(session_ref.clone(), acp_session_id);
             transport
                 .publish_event(HomeClientEvent::SessionCreated {
                     session_id: session_ref,
-                    cwd,
+                    workspace_id: workspace.id.clone(),
+                    workspace_name: workspace.name.clone(),
                 })
                 .await?;
             Ok(true)
@@ -310,7 +332,8 @@ async fn handle_command<T: ClientTransport>(
 
             let (session_ref, session_id) = match resolve_session(
                 transport,
-                default_cwd,
+                workspaces,
+                default_workspace_id,
                 agent.as_ref(),
                 sessions,
                 session_id,
@@ -429,7 +452,8 @@ async fn handle_internal_event<T: ClientTransport>(
 
 async fn resolve_session<T: ClientTransport>(
     transport: &mut T,
-    default_cwd: &Path,
+    workspaces: &[WorkspaceConfig],
+    default_workspace_id: &str,
     agent: &ClientSideConnection,
     sessions: &mut HashMap<String, SessionId>,
     requested_session: Option<String>,
@@ -457,14 +481,15 @@ async fn resolve_session<T: ClientTransport>(
         return Ok(None);
     }
 
-    let cwd = default_cwd.to_path_buf();
-    let session_id = create_session(agent, &cwd).await?;
+    let workspace = resolve_workspace(workspaces, None, Some(default_workspace_id))?;
+    let session_id = create_session(agent, workspace).await?;
     let session_ref = session_id.to_string();
     sessions.insert(session_ref.clone(), session_id.clone());
     transport
         .publish_event(HomeClientEvent::SessionCreated {
             session_id: session_ref.clone(),
-            cwd,
+            workspace_id: workspace.id.clone(),
+            workspace_name: workspace.name.clone(),
         })
         .await?;
 
@@ -480,18 +505,37 @@ async fn stream_stderr(stderr: ChildStderr, internal_tx: mpsc::UnboundedSender<I
     }
 }
 
-async fn create_session(agent: &ClientSideConnection, cwd: &Path) -> Result<SessionId> {
+async fn create_session(
+    agent: &ClientSideConnection,
+    workspace: &WorkspaceConfig,
+) -> Result<SessionId> {
     let response = agent
-        .new_session(NewSessionRequest::new(cwd))
+        .new_session(NewSessionRequest::new(&workspace.path))
         .await
         .context("创建会话失败")?;
     Ok(response.session_id)
 }
 
-fn resolve_cwd(default_cwd: &Path, requested_cwd: Option<PathBuf>) -> PathBuf {
-    match requested_cwd {
-        Some(path) if path.is_absolute() => path,
-        Some(path) => default_cwd.join(path),
-        None => default_cwd.to_path_buf(),
+fn resolve_workspace<'a>(
+    workspaces: &'a [WorkspaceConfig],
+    requested_workspace_id: Option<&str>,
+    default_workspace_id: Option<&str>,
+) -> Result<&'a WorkspaceConfig> {
+    if let Some(workspace_id) = requested_workspace_id {
+        return workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .with_context(|| format!("未知 workspace: {workspace_id}"));
     }
+
+    if let Some(default_workspace_id) = default_workspace_id {
+        return workspaces
+            .iter()
+            .find(|workspace| workspace.id == default_workspace_id)
+            .with_context(|| format!("默认 workspace 不存在: {default_workspace_id}"));
+    }
+
+    workspaces
+        .first()
+        .context("当前没有可用工作区，无法创建会话")
 }

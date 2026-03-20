@@ -194,3 +194,66 @@
   - caching the shell too aggressively and making updates look stale
   - shipping icons or manifest metadata that install poorly on some platforms
   - adding PWA UX that assumes browser support the current environment may not have
+
+## 2026-03-20 Workspace Allowlist For Session Creation
+
+- Goal: replace browser-provided `cwd` session creation with a home-client-owned workspace allowlist keyed by `workspace_id`.
+- Scope:
+  - add structured workspace configuration to the home client
+  - advertise allowed workspaces from the home client to the relay server
+  - update relay/browser session creation to target `workspace_id` instead of raw paths
+  - keep the existing single-device debug flow working with a sensible default workspace
+- Invariants:
+  - raw local workspace paths must stay on the home client
+  - the relay server remains a control plane and must not invent filesystem paths
+  - existing prompt streaming and permission round-trips must keep working
+  - local debug mode should still be usable without extra setup
+- Likely files/modules to change:
+  - `PLANS.md`
+  - `src/config.rs`
+  - `src/main.rs`
+  - `src/types.rs`
+  - `src/protocol.rs`
+  - `src/runtime.rs`
+  - `src/transport.rs`
+  - `src/relay_server.rs`
+  - `src/relay_console.html`
+- Verification steps:
+  - run `cargo fmt`
+  - run `cargo check`
+  - inspect the browser console flow for device -> workspace -> create session
+  - verify the home client still has a default workspace when no explicit allowlist is configured
+- Main risks:
+  - introducing protocol drift between relay server, browser, and home client message shapes
+  - making auto-created local debug sessions ambiguous when no default workspace is available
+  - accidentally leaking local filesystem paths back into browser-visible metadata
+
+## 2026-03-20 Caddy Browser Authentication
+
+- Goal: protect browser/PWA access behind Caddy-authenticated requests while teaching the relay server to trust and enforce authenticated browser identity.
+- Scope:
+  - add relay-server browser auth configuration for trusted user headers and optional proxy shared secret
+  - require authenticated browser identity on HTTP shell routes and browser websocket upgrades
+  - scope relay sessions to authenticated browser users so session lists and adoption are not globally shared
+  - add a Caddy deployment example for the authenticated reverse-proxy setup
+- Invariants:
+  - home client auth remains separate and still uses the existing client token
+  - browser auth should be optional for local development when Caddy is not in front
+  - the relay server must not trust arbitrary spoofed browser identity when a proxy secret is configured
+  - health checks and client websocket connectivity should keep working
+- Likely files/modules to change:
+  - `PLANS.md`
+  - `src/protocol.rs`
+  - `src/relay_server.rs`
+  - `src/relay_state.rs`
+  - `docs/caddy-auth.md`
+  - `deploy/Caddyfile.example`
+- Verification steps:
+  - run `cargo fmt`
+  - run `cargo check`
+  - inspect the relay browser routes for unauthorized vs authenticated flow
+  - confirm the Caddy example forwards both browser identity and proxy secret headers
+- Main risks:
+  - locking out the PWA shell if auth is enforced too aggressively on static assets
+  - leaving legacy persisted sessions inaccessible or globally visible after user scoping is introduced
+  - documenting a Caddy pattern that drifts from the relay server's actual header expectations
