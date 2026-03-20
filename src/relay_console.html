@@ -1,0 +1,670 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Relay Console</title>
+    <style>
+      :root {
+        --bg: #f4f1ea;
+        --panel: rgba(255, 252, 245, 0.92);
+        --line: #cdbda6;
+        --ink: #1f2a1d;
+        --muted: #5d6959;
+        --accent: #2d6a4f;
+        --accent-soft: #dceee3;
+        --warning: #a44a3f;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at top left, rgba(45, 106, 79, 0.12), transparent 32%),
+          radial-gradient(circle at bottom right, rgba(164, 74, 63, 0.12), transparent 28%),
+          linear-gradient(180deg, #f7f3eb 0%, #ede5d6 100%);
+      }
+
+      .shell {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 32px 20px 48px;
+      }
+
+      .hero {
+        display: flex;
+        justify-content: space-between;
+        gap: 20px;
+        align-items: end;
+        margin-bottom: 20px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(2rem, 4vw, 3.4rem);
+        line-height: 0.95;
+        letter-spacing: -0.04em;
+      }
+
+      .sub {
+        max-width: 520px;
+        color: var(--muted);
+        font-size: 1rem;
+        line-height: 1.45;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: 320px 1fr;
+        gap: 18px;
+      }
+
+      .card {
+        background: var(--panel);
+        backdrop-filter: blur(18px);
+        border: 1px solid var(--line);
+        border-radius: 20px;
+        box-shadow: 0 18px 50px rgba(56, 47, 35, 0.08);
+      }
+
+      .stack {
+        display: grid;
+        gap: 18px;
+      }
+
+      .card h2 {
+        margin: 0 0 12px;
+        font-size: 0.95rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+      }
+
+      .section {
+        padding: 18px;
+      }
+
+      label {
+        display: block;
+        margin-bottom: 8px;
+        font-size: 0.9rem;
+        color: var(--muted);
+      }
+
+      input,
+      select,
+      textarea,
+      button {
+        width: 100%;
+        font: inherit;
+      }
+
+      input,
+      select,
+      textarea {
+        padding: 12px 13px;
+        border-radius: 14px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.75);
+        color: var(--ink);
+      }
+
+      textarea {
+        min-height: 110px;
+        resize: vertical;
+      }
+
+      button {
+        cursor: pointer;
+        padding: 12px 14px;
+        border-radius: 999px;
+        border: 1px solid transparent;
+        background: var(--accent);
+        color: #f8faf7;
+        transition: transform 120ms ease, opacity 120ms ease;
+      }
+
+      button.secondary {
+        background: transparent;
+        border-color: var(--line);
+        color: var(--ink);
+      }
+
+      button:hover {
+        transform: translateY(-1px);
+      }
+
+      button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+        transform: none;
+      }
+
+      .row {
+        display: flex;
+        gap: 10px;
+      }
+
+      .row > * {
+        flex: 1;
+      }
+
+      .device-list,
+      .permission-list {
+        display: grid;
+        gap: 10px;
+      }
+
+      .device-item,
+      .permission-item {
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        padding: 12px;
+        background: rgba(255, 255, 255, 0.45);
+      }
+
+      .device-item strong,
+      .permission-item strong {
+        display: block;
+        margin-bottom: 4px;
+      }
+
+      .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 0.82rem;
+        color: var(--muted);
+      }
+
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: #9f8f79;
+      }
+
+      .dot.live {
+        background: var(--accent);
+      }
+
+      .stream {
+        min-height: 420px;
+        padding: 16px;
+        border-radius: 18px;
+        background: #1f241f;
+        color: #edf6ef;
+        overflow: auto;
+        white-space: pre-wrap;
+        font-family: "SF Mono", ui-monospace, Menlo, monospace;
+        line-height: 1.45;
+      }
+
+      .meta {
+        color: #a6c4af;
+      }
+
+      .error {
+        color: #ffb4a9;
+      }
+
+      .hint {
+        margin-top: 8px;
+        color: var(--muted);
+        font-size: 0.85rem;
+      }
+
+      @media (max-width: 860px) {
+        .grid {
+          grid-template-columns: 1fr;
+        }
+
+        .hero {
+          display: block;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <div class="hero">
+        <div>
+          <h1>Codex Relay Console</h1>
+          <p class="sub">
+            A minimal browser console for the relay server. It speaks the same
+            browser websocket protocol the future PWA will use, so we can verify
+            session routing before building the polished app shell.
+          </p>
+        </div>
+      </div>
+
+      <div class="grid">
+        <div class="stack">
+          <section class="card section">
+            <h2>Connection</h2>
+            <div class="row">
+              <button id="connectBtn">Connect</button>
+              <button id="disconnectBtn" class="secondary">Disconnect</button>
+            </div>
+            <p class="hint" id="connectionStatus">Disconnected</p>
+          </section>
+
+          <section class="card section">
+            <h2>Devices</h2>
+            <div class="device-list" id="deviceList"></div>
+            <p class="hint">Select a live home client, then create a relay session.</p>
+          </section>
+
+          <section class="card section">
+            <h2>Session</h2>
+            <label for="deviceSelect">Target device</label>
+            <select id="deviceSelect"></select>
+
+            <label for="cwdInput">Working directory override</label>
+            <input id="cwdInput" placeholder="/optional/path" />
+
+            <div class="row" style="margin-top: 12px">
+              <button id="newSessionBtn">Create Session</button>
+              <button id="refreshDevicesBtn" class="secondary">Refresh</button>
+            </div>
+
+            <p class="hint" id="sessionStatus">No relay session yet.</p>
+          </section>
+
+          <section class="card section">
+            <h2>Saved Sessions</h2>
+            <div class="device-list" id="sessionList"></div>
+            <div class="row" style="margin-top: 12px">
+              <button id="refreshSessionsBtn" class="secondary">Refresh Sessions</button>
+            </div>
+          </section>
+
+          <section class="card section">
+            <h2>Permissions</h2>
+            <div class="permission-list" id="permissionList"></div>
+          </section>
+        </div>
+
+        <div class="stack">
+          <section class="card section">
+            <h2>Prompt</h2>
+            <label for="promptInput">Message</label>
+            <textarea id="promptInput" placeholder="Ask Codex to inspect the workspace, run a command, or edit code."></textarea>
+            <div class="row" style="margin-top: 12px">
+              <button id="sendPromptBtn">Send Prompt</button>
+              <button id="olderHistoryBtn" class="secondary">Older History</button>
+              <button id="clearOutputBtn" class="secondary">Clear Output</button>
+            </div>
+          </section>
+
+          <section class="card section">
+            <h2>Stream</h2>
+            <div class="stream" id="stream"></div>
+          </section>
+        </div>
+      </div>
+    </main>
+
+    <script>
+      const state = {
+        socket: null,
+        devices: new Map(),
+        sessions: new Map(),
+        currentSessionId: null,
+        historyCursor: null,
+        historyHasMore: false,
+        lastHistoryBeforeSeq: null,
+        permissions: new Map(),
+      };
+
+      const deviceList = document.getElementById("deviceList");
+      const deviceSelect = document.getElementById("deviceSelect");
+      const sessionList = document.getElementById("sessionList");
+      const connectionStatus = document.getElementById("connectionStatus");
+      const sessionStatus = document.getElementById("sessionStatus");
+      const stream = document.getElementById("stream");
+      const permissionList = document.getElementById("permissionList");
+
+      const connectBtn = document.getElementById("connectBtn");
+      const disconnectBtn = document.getElementById("disconnectBtn");
+      const newSessionBtn = document.getElementById("newSessionBtn");
+      const refreshDevicesBtn = document.getElementById("refreshDevicesBtn");
+      const refreshSessionsBtn = document.getElementById("refreshSessionsBtn");
+      const sendPromptBtn = document.getElementById("sendPromptBtn");
+      const olderHistoryBtn = document.getElementById("olderHistoryBtn");
+      const clearOutputBtn = document.getElementById("clearOutputBtn");
+      const cwdInput = document.getElementById("cwdInput");
+      const promptInput = document.getElementById("promptInput");
+
+      function wsUrl() {
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        return `${protocol}//${window.location.host}/ws/browser`;
+      }
+
+      function appendOutput(text, className = "") {
+        const line = document.createElement("div");
+        if (className) line.className = className;
+        line.textContent = text;
+        stream.appendChild(line);
+        stream.scrollTop = stream.scrollHeight;
+      }
+
+      function setConnectionStatus(text) {
+        connectionStatus.textContent = text;
+      }
+
+      function renderDevices() {
+        const devices = Array.from(state.devices.values()).sort((a, b) =>
+          a.device_name.localeCompare(b.device_name)
+        );
+
+        deviceList.innerHTML = "";
+        deviceSelect.innerHTML = "";
+
+        if (devices.length === 0) {
+          deviceList.innerHTML = '<p class="hint">No live home clients yet.</p>';
+          const empty = document.createElement("option");
+          empty.textContent = "No devices";
+          empty.value = "";
+          deviceSelect.appendChild(empty);
+          return;
+        }
+
+        for (const device of devices) {
+          const item = document.createElement("div");
+          item.className = "device-item";
+          item.innerHTML = `
+            <strong>${device.device_name}</strong>
+            <div>${device.device_id}</div>
+            <div class="status">
+              <span class="dot ${device.connected ? "live" : ""}"></span>
+              ${device.connected ? "Online" : "Offline"}
+            </div>
+          `;
+          deviceList.appendChild(item);
+
+          const option = document.createElement("option");
+          option.value = device.device_id;
+          option.textContent = `${device.device_name} (${device.device_id})`;
+          if (!device.connected) option.disabled = true;
+          deviceSelect.appendChild(option);
+        }
+      }
+
+      function renderPermissions() {
+        permissionList.innerHTML = "";
+        if (state.permissions.size === 0) {
+          permissionList.innerHTML = '<p class="hint">No pending permission requests.</p>';
+          return;
+        }
+
+        for (const permission of state.permissions.values()) {
+          const item = document.createElement("div");
+          item.className = "permission-item";
+          item.innerHTML = `
+            <strong>${permission.request_id}</strong>
+            <div>session: ${permission.session_id ?? "unknown"}</div>
+          `;
+
+          const buttons = document.createElement("div");
+          buttons.className = "row";
+          buttons.style.marginTop = "10px";
+
+          for (const option of permission.options) {
+            const button = document.createElement("button");
+            button.className = option.index === 0 ? "" : "secondary";
+            button.textContent = `${option.index}: ${option.name}`;
+            button.addEventListener("click", () => {
+              send({
+                type: "resolve_permission",
+                request_id: permission.request_id,
+                selected_index: option.index,
+              });
+              state.permissions.delete(permission.request_id);
+              renderPermissions();
+            });
+            buttons.appendChild(button);
+          }
+
+          item.appendChild(buttons);
+          permissionList.appendChild(item);
+        }
+      }
+
+      function renderSessions() {
+        sessionList.innerHTML = "";
+        const sessions = Array.from(state.sessions.values()).sort(
+          (a, b) => b.updated_at - a.updated_at
+        );
+
+        if (sessions.length === 0) {
+          sessionList.innerHTML = '<p class="hint">No persisted relay sessions yet.</p>';
+          return;
+        }
+
+        for (const session of sessions) {
+          const item = document.createElement("div");
+          item.className = "device-item";
+          item.innerHTML = `
+            <strong>${session.session_id}</strong>
+            <div>device: ${session.device_id}</div>
+            <div>status: ${session.status}</div>
+            <div>cwd: ${session.cwd ?? "(unknown)"}</div>
+          `;
+
+          const row = document.createElement("div");
+          row.className = "row";
+          row.style.marginTop = "10px";
+
+          const adoptButton = document.createElement("button");
+          adoptButton.textContent = "Adopt";
+          adoptButton.addEventListener("click", () => {
+            state.currentSessionId = session.session_id;
+            sessionStatus.textContent = `Session ${session.session_id} on ${session.device_id}`;
+            send({ type: "adopt_session", session_id: session.session_id });
+            state.historyCursor = null;
+            state.historyHasMore = false;
+            state.lastHistoryBeforeSeq = null;
+          });
+
+          const historyButton = document.createElement("button");
+          historyButton.className = "secondary";
+          historyButton.textContent = "History";
+          historyButton.addEventListener("click", () => {
+            state.currentSessionId = session.session_id;
+            sessionStatus.textContent = `Session ${session.session_id} on ${session.device_id}`;
+            send({ type: "adopt_session", session_id: session.session_id });
+            requestHistory(session.session_id, null);
+          });
+
+          row.appendChild(adoptButton);
+          row.appendChild(historyButton);
+          item.appendChild(row);
+          sessionList.appendChild(item);
+        }
+      }
+
+      function send(payload) {
+        if (!state.socket || state.socket.readyState !== WebSocket.OPEN) {
+          appendOutput("[browser] websocket is not connected", "error");
+          return;
+        }
+        state.socket.send(JSON.stringify(payload));
+      }
+
+      function requestHistory(sessionId, beforeSeq = null) {
+        state.lastHistoryBeforeSeq = beforeSeq;
+        send({
+          type: "get_session_history",
+          session_id: sessionId,
+          before_seq: beforeSeq,
+          limit: 50,
+        });
+      }
+
+      function connect() {
+        if (state.socket && state.socket.readyState <= WebSocket.OPEN) {
+          return;
+        }
+
+        const socket = new WebSocket(wsUrl());
+        state.socket = socket;
+        setConnectionStatus("Connecting...");
+
+        socket.addEventListener("open", () => {
+          setConnectionStatus("Connected");
+          appendOutput("[browser] connected", "meta");
+          send({ type: "list_devices" });
+          send({ type: "list_sessions" });
+        });
+
+        socket.addEventListener("close", () => {
+          setConnectionStatus("Disconnected");
+          appendOutput("[browser] disconnected", "meta");
+        });
+
+        socket.addEventListener("message", (event) => {
+          const message = JSON.parse(event.data);
+
+          switch (message.type) {
+            case "device_list":
+              state.devices = new Map(
+                message.devices.map((device) => [device.device_id, device])
+              );
+              renderDevices();
+              break;
+            case "session_list":
+              state.sessions = new Map(
+                message.sessions.map((session) => [session.session_id, session])
+              );
+              renderSessions();
+              break;
+            case "session_history":
+              if (state.lastHistoryBeforeSeq === null) {
+                stream.innerHTML = "";
+                appendOutput(`[history] ${message.session_id}`, "meta");
+              }
+              for (const event of message.events) {
+                const seqLabel =
+                  event.seq_end && event.seq_end !== event.seq
+                    ? `${event.seq}-${event.seq_end}`
+                    : `${event.seq}`;
+                const suffix = event.text ?? event.stop_reason ?? event.request_id ?? "";
+                appendOutput(`[${seqLabel}] [${event.kind}] ${suffix}`.trim(), "meta");
+              }
+              state.historyCursor = message.next_before_seq;
+              state.historyHasMore = message.has_more;
+              break;
+            case "device_status":
+              state.devices.set(message.device.device_id, message.device);
+              renderDevices();
+              break;
+            case "session_created":
+              state.currentSessionId = message.session_id;
+              state.historyCursor = null;
+              state.historyHasMore = false;
+              state.lastHistoryBeforeSeq = null;
+              sessionStatus.textContent = `Session ${message.session_id} on ${message.device_id}`;
+              appendOutput(
+                `[session] created ${message.session_id} cwd=${message.cwd}`,
+                "meta"
+              );
+              send({ type: "list_sessions" });
+              break;
+            case "output_chunk":
+              appendOutput(message.text);
+              break;
+            case "prompt_finished":
+              appendOutput(
+                `[done] ${message.session_id} stop_reason=${message.stop_reason}`,
+                "meta"
+              );
+              break;
+            case "permission_requested":
+              state.permissions.set(message.request_id, message);
+              renderPermissions();
+              appendOutput(
+                `[permission] ${message.request_id} for ${message.session_id ?? "unknown"}`,
+                "meta"
+              );
+              break;
+            case "info":
+              appendOutput(`[info] ${message.message}`, "meta");
+              break;
+            case "error":
+              appendOutput(`[error] ${message.message}`, "error");
+              break;
+            default:
+              appendOutput(`[unknown] ${event.data}`, "meta");
+          }
+        });
+      }
+
+      connectBtn.addEventListener("click", connect);
+
+      disconnectBtn.addEventListener("click", () => {
+        if (state.socket) state.socket.close();
+      });
+
+      refreshDevicesBtn.addEventListener("click", () => {
+        send({ type: "list_devices" });
+      });
+
+      refreshSessionsBtn.addEventListener("click", () => {
+        send({ type: "list_sessions" });
+      });
+
+      newSessionBtn.addEventListener("click", () => {
+        const deviceId = deviceSelect.value;
+        if (!deviceId) {
+          appendOutput("[browser] choose a live device first", "error");
+          return;
+        }
+        send({
+          type: "create_session",
+          device_id: deviceId,
+          cwd: cwdInput.value.trim() || null,
+        });
+      });
+
+      sendPromptBtn.addEventListener("click", () => {
+        if (!state.currentSessionId) {
+          appendOutput("[browser] create a session first", "error");
+          return;
+        }
+        const text = promptInput.value.trim();
+        if (!text) return;
+        appendOutput(`[you] ${text}`, "meta");
+        send({ type: "prompt", session_id: state.currentSessionId, text });
+        promptInput.value = "";
+      });
+
+      olderHistoryBtn.addEventListener("click", () => {
+        if (!state.currentSessionId) {
+          appendOutput("[browser] choose a session first", "error");
+          return;
+        }
+        if (!state.historyHasMore && state.historyCursor === null) {
+          requestHistory(state.currentSessionId, null);
+          return;
+        }
+        if (!state.historyHasMore) {
+          appendOutput("[browser] no older history", "meta");
+          return;
+        }
+        requestHistory(state.currentSessionId, state.historyCursor);
+      });
+
+      clearOutputBtn.addEventListener("click", () => {
+        stream.innerHTML = "";
+      });
+
+      connect();
+    </script>
+  </body>
+</html>
