@@ -399,6 +399,15 @@
         historyHasMore: false,
         lastHistoryBeforeSeq: null,
         permissions: new Map(),
+        reconnectAttempt: 0,
+        reconnectTimer: null,
+        manualDisconnect: false,
+      };
+
+      const reconnectPolicy = {
+        baseDelayMs: 1000,
+        maxDelayMs: 30000,
+        jitterMs: 1000,
       };
 
       const pwaState = {
@@ -432,8 +441,22 @@
         ? window.matchMedia("(display-mode: standalone)")
         : null;
 
+      function isLoopbackHostname(hostname) {
+        if (!hostname) {
+          return false;
+        }
+        const normalized = hostname.trim().toLowerCase();
+        return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+      }
+
       function wsUrl() {
-        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const isHttps = window.location.protocol === "https:";
+        if (!isHttps && !isLoopbackHostname(window.location.hostname)) {
+          throw new Error(
+            "secure websocket required: open this console over HTTPS (or use localhost for local dev)"
+          );
+        }
+        const protocol = isHttps ? "wss:" : "ws:";
         return `${protocol}//${window.location.host}/ws/browser`;
       }
 
@@ -447,6 +470,47 @@
 
       function setConnectionStatus(text) {
         connectionStatus.textContent = text;
+      }
+
+      function clearNode(node) {
+        while (node.firstChild) {
+          node.removeChild(node.firstChild);
+        }
+      }
+
+      function appendHint(container, text) {
+        const hint = document.createElement("p");
+        hint.className = "hint";
+        hint.textContent = text;
+        container.appendChild(hint);
+      }
+
+      function computeReconnectDelayMs(attempt) {
+        const exponent = Math.min(Math.max(attempt - 1, 0), 8);
+        const baseDelay = reconnectPolicy.baseDelayMs * (2 ** exponent);
+        const cappedBase = Math.min(baseDelay, reconnectPolicy.maxDelayMs);
+        const jitter = Math.floor(Math.random() * (reconnectPolicy.jitterMs + 1));
+        return cappedBase + jitter;
+      }
+
+      function clearReconnectTimer() {
+        if (state.reconnectTimer !== null) {
+          window.clearTimeout(state.reconnectTimer);
+          state.reconnectTimer = null;
+        }
+      }
+
+      function scheduleReconnect() {
+        if (state.manualDisconnect || state.reconnectTimer !== null) {
+          return;
+        }
+        state.reconnectAttempt += 1;
+        const delayMs = computeReconnectDelayMs(state.reconnectAttempt);
+        setConnectionStatus(`Disconnected (retry in ${(delayMs / 1000).toFixed(1)}s)`);
+        state.reconnectTimer = window.setTimeout(() => {
+          state.reconnectTimer = null;
+          connect();
+        }, delayMs);
       }
 
       function isStandaloneMode() {
@@ -551,6 +615,23 @@
         return `Session ${session.session_id} on ${session.device_id} in ${workspace}`;
       }
 
+      function upsertSession(session) {
+        state.sessions.set(session.session_id, session);
+        if (state.currentSessionId === session.session_id) {
+          sessionStatus.textContent = describeSession(session);
+        }
+        renderSessions();
+      }
+
+      function removePermissionsForSession(sessionId) {
+        for (const [requestId, permission] of state.permissions.entries()) {
+          if (permission.session_id === sessionId) {
+            state.permissions.delete(requestId);
+          }
+        }
+        renderPermissions();
+      }
+
       function renderWorkspaceSelect() {
         const selectedDevice = state.devices.get(deviceSelect.value);
         const previousWorkspaceId = workspaceSelect.value;
@@ -597,11 +678,11 @@
         );
         const previousDeviceId = deviceSelect.value;
 
-        deviceList.innerHTML = "";
-        deviceSelect.innerHTML = "";
+        clearNode(deviceList);
+        clearNode(deviceSelect);
 
         if (devices.length === 0) {
-          deviceList.innerHTML = '<p class="hint">No live home clients yet.</p>';
+          appendHint(deviceList, "No live home clients yet.");
           const empty = document.createElement("option");
           empty.textContent = "No devices";
           empty.value = "";
@@ -616,15 +697,32 @@
           );
           const item = document.createElement("div");
           item.className = "device-item";
-          item.innerHTML = `
-            <strong>${device.device_name}</strong>
-            <div>${device.device_id}</div>
-            <div>workspaces: ${workspaceNames.join(", ") || "none published"}</div>
-            <div class="status">
-              <span class="dot ${device.connected ? "live" : ""}"></span>
-              ${device.connected ? "Online" : "Offline"}
-            </div>
-          `;
+
+          const title = document.createElement("strong");
+          title.textContent = String(device.device_name ?? "Unknown device");
+          item.appendChild(title);
+
+          const idLine = document.createElement("div");
+          idLine.textContent = String(device.device_id ?? "unknown-device-id");
+          item.appendChild(idLine);
+
+          const workspacesLine = document.createElement("div");
+          workspacesLine.textContent = `workspaces: ${
+            workspaceNames.join(", ") || "none published"
+          }`;
+          item.appendChild(workspacesLine);
+
+          const status = document.createElement("div");
+          status.className = "status";
+
+          const dot = document.createElement("span");
+          dot.className = `dot${device.connected ? " live" : ""}`;
+          status.appendChild(dot);
+          status.appendChild(
+            document.createTextNode(device.connected ? "Online" : "Offline")
+          );
+          item.appendChild(status);
+
           deviceList.appendChild(item);
 
           const option = document.createElement("option");
@@ -645,25 +743,29 @@
       }
 
       function renderPermissions() {
-        permissionList.innerHTML = "";
+        clearNode(permissionList);
         if (state.permissions.size === 0) {
-          permissionList.innerHTML = '<p class="hint">No pending permission requests.</p>';
+          appendHint(permissionList, "No pending permission requests.");
           return;
         }
 
         for (const permission of state.permissions.values()) {
           const item = document.createElement("div");
           item.className = "permission-item";
-          item.innerHTML = `
-            <strong>${permission.request_id}</strong>
-            <div>session: ${permission.session_id ?? "unknown"}</div>
-          `;
+
+          const title = document.createElement("strong");
+          title.textContent = String(permission.request_id ?? "unknown-request");
+          item.appendChild(title);
+
+          const sessionLine = document.createElement("div");
+          sessionLine.textContent = `session: ${permission.session_id ?? "unknown"}`;
+          item.appendChild(sessionLine);
 
           const buttons = document.createElement("div");
           buttons.className = "row";
           buttons.style.marginTop = "10px";
 
-          for (const option of permission.options) {
+          for (const option of Array.isArray(permission.options) ? permission.options : []) {
             const button = document.createElement("button");
             button.className = option.index === 0 ? "" : "secondary";
             button.textContent = `${option.index}: ${option.name}`;
@@ -685,25 +787,37 @@
       }
 
       function renderSessions() {
-        sessionList.innerHTML = "";
+        clearNode(sessionList);
         const sessions = Array.from(state.sessions.values()).sort(
           (a, b) => b.updated_at - a.updated_at
         );
 
         if (sessions.length === 0) {
-          sessionList.innerHTML = '<p class="hint">No persisted relay sessions yet.</p>';
+          appendHint(sessionList, "No persisted relay sessions yet.");
           return;
         }
 
         for (const session of sessions) {
           const item = document.createElement("div");
           item.className = "device-item";
-          item.innerHTML = `
-            <strong>${session.session_id}</strong>
-            <div>device: ${session.device_id}</div>
-            <div>status: ${session.status}</div>
-            <div>workspace: ${session.workspace_name ?? "(unknown)"} (${session.workspace_id ?? "unknown"})</div>
-          `;
+
+          const title = document.createElement("strong");
+          title.textContent = String(session.session_id ?? "unknown-session");
+          item.appendChild(title);
+
+          const deviceLine = document.createElement("div");
+          deviceLine.textContent = `device: ${session.device_id ?? "unknown"}`;
+          item.appendChild(deviceLine);
+
+          const statusLine = document.createElement("div");
+          statusLine.textContent = `status: ${session.status ?? "unknown"}`;
+          item.appendChild(statusLine);
+
+          const workspaceLine = document.createElement("div");
+          workspaceLine.textContent = `workspace: ${
+            session.workspace_name ?? "(unknown)"
+          } (${session.workspace_id ?? "unknown"})`;
+          item.appendChild(workspaceLine);
 
           const row = document.createElement("div");
           row.className = "row";
@@ -730,8 +844,35 @@
             requestHistory(session.session_id, null);
           });
 
+          const closeButton = document.createElement("button");
+          closeButton.className = "secondary";
+          closeButton.textContent = "Close";
+          closeButton.addEventListener("click", () => {
+            if (!window.confirm(`Close session ${session.session_id}? It will become read-only.`)) {
+              return;
+            }
+            send({ type: "close_session", session_id: session.session_id });
+          });
+
+          const deleteButton = document.createElement("button");
+          deleteButton.className = "secondary";
+          deleteButton.textContent = "Delete";
+          deleteButton.disabled = session.status !== "closed";
+          deleteButton.addEventListener("click", () => {
+            if (
+              !window.confirm(
+                `Delete session ${session.session_id}? This removes relay history and cannot be undone.`
+              )
+            ) {
+              return;
+            }
+            send({ type: "delete_session", session_id: session.session_id });
+          });
+
           row.appendChild(adoptButton);
           row.appendChild(historyButton);
+          row.appendChild(closeButton);
+          row.appendChild(deleteButton);
           item.appendChild(row);
           sessionList.appendChild(item);
         }
@@ -756,28 +897,65 @@
       }
 
       function connect() {
-        if (state.socket && state.socket.readyState <= WebSocket.OPEN) {
+        if (
+          state.socket &&
+          (state.socket.readyState === WebSocket.CONNECTING ||
+            state.socket.readyState === WebSocket.OPEN)
+        ) {
           return;
         }
 
-        const socket = new WebSocket(wsUrl());
+        let url;
+        try {
+          url = wsUrl();
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : "failed to build websocket URL";
+          setConnectionStatus("Secure connection required");
+          appendOutput(`[browser] ${message}`, "error");
+          return;
+        }
+
+        clearReconnectTimer();
+        const socket = new WebSocket(url);
         state.socket = socket;
         setConnectionStatus("Connecting...");
 
         socket.addEventListener("open", () => {
+          state.reconnectAttempt = 0;
+          clearReconnectTimer();
           setConnectionStatus("Connected");
           appendOutput("[browser] connected", "meta");
           send({ type: "list_devices" });
           send({ type: "list_sessions" });
         });
 
+        socket.addEventListener("error", () => {
+          appendOutput("[browser] websocket error", "error");
+        });
+
         socket.addEventListener("close", () => {
-          setConnectionStatus("Disconnected");
-          appendOutput("[browser] disconnected", "meta");
+          if (state.socket === socket) {
+            state.socket = null;
+          }
+          if (state.manualDisconnect) {
+            setConnectionStatus("Disconnected");
+            appendOutput("[browser] disconnected", "meta");
+            return;
+          }
+
+          appendOutput("[browser] disconnected; retry scheduled", "meta");
+          scheduleReconnect();
         });
 
         socket.addEventListener("message", (event) => {
-          const message = JSON.parse(event.data);
+          let message;
+          try {
+            message = JSON.parse(event.data);
+          } catch (error) {
+            appendOutput("[error] invalid JSON payload from relay server", "error");
+            return;
+          }
 
           switch (message.type) {
             case "device_list":
@@ -790,7 +968,28 @@
               state.sessions = new Map(
                 message.sessions.map((session) => [session.session_id, session])
               );
+              if (state.currentSessionId) {
+                sessionStatus.textContent = describeSession(
+                  state.sessions.get(state.currentSessionId)
+                );
+              }
               renderSessions();
+              break;
+            case "session_updated":
+              upsertSession(message.session);
+              break;
+            case "session_removed":
+              state.sessions.delete(message.session_id);
+              removePermissionsForSession(message.session_id);
+              if (state.currentSessionId === message.session_id) {
+                state.currentSessionId = null;
+                sessionStatus.textContent = "No relay session yet.";
+              }
+              renderSessions();
+              break;
+            case "session_closed":
+              removePermissionsForSession(message.session_id);
+              appendOutput(`[session] closed ${message.session_id}`, "meta");
               break;
             case "session_history":
               if (state.lastHistoryBeforeSeq === null) {
@@ -824,7 +1023,6 @@
                 `[session] created ${message.session_id} workspace=${message.workspace_name} (${message.workspace_id})`,
                 "meta"
               );
-              send({ type: "list_sessions" });
               break;
             case "output_chunk":
               appendOutput(message.text);
@@ -855,10 +1053,19 @@
         });
       }
 
-      connectBtn.addEventListener("click", connect);
+      connectBtn.addEventListener("click", () => {
+        state.manualDisconnect = false;
+        connect();
+      });
 
       disconnectBtn.addEventListener("click", () => {
-        if (state.socket) state.socket.close();
+        state.manualDisconnect = true;
+        clearReconnectTimer();
+        if (state.socket) {
+          state.socket.close();
+          state.socket = null;
+        }
+        setConnectionStatus("Disconnected");
       });
 
       refreshDevicesBtn.addEventListener("click", () => {
@@ -952,7 +1159,12 @@
         appendOutput("[pwa] app installed", "meta");
       });
 
-      window.addEventListener("online", refreshPwaChrome);
+      window.addEventListener("online", () => {
+        refreshPwaChrome();
+        if (!state.manualDisconnect) {
+          connect();
+        }
+      });
       window.addEventListener("offline", refreshPwaChrome);
 
       if (displayModeMedia) {

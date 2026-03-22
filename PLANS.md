@@ -228,6 +228,147 @@
   - making auto-created local debug sessions ambiguous when no default workspace is available
   - accidentally leaking local filesystem paths back into browser-visible metadata
 
+## 2026-03-20 Reconnect Resume And Session Rebind
+
+- Goal: allow relay sessions to survive home-client reconnects by re-binding persisted relay session ids to resumable ACP session ids after the device reconnects.
+- Scope:
+  - persist the opaque ACP/client session id alongside relay session metadata
+  - extend the relay protocol with an explicit resume command and resume success/failure events
+  - teach the home client runtime to resume ACP sessions and rebuild its in-memory relay->ACP session map
+  - keep browser-facing session ids stable and history readable across disconnects
+- Invariants:
+  - relay session ids remain server-owned logical ids
+  - local workspace paths stay on the home client
+  - the relay server stores opaque client session ids only for routing/resume, not filesystem paths
+  - reconnect failure must degrade to a readable but non-runnable session instead of silently misrouting prompts
+- Likely files/modules to change:
+  - `PLANS.md`
+  - `src/protocol.rs`
+  - `src/types.rs`
+  - `src/runtime.rs`
+  - `src/transport.rs`
+  - `src/relay_server.rs`
+  - `src/relay_state.rs`
+- Verification steps:
+  - run `cargo fmt`
+  - run `cargo check`
+  - run `cargo test`
+  - run `cargo clippy --all-targets --all-features -- -D warnings`
+  - inspect the reconnect flow: create session -> persist opaque client session id -> simulate device disconnect -> resume command rebinds relay session
+- Main risks:
+  - assuming ACP resume semantics that differ from `codex-acp` runtime behavior
+  - restoring stale client session ids and leaving relay sessions in a misleading status
+  - introducing protocol changes that update one side of the relay without the other
+
+### Follow-up: Browser Session Updated Broadcast
+
+- Goal: push single-session summary changes to connected browsers so reconnect/resume and other state transitions update the session list without requiring a full `list_sessions` refresh.
+- Scope:
+  - add a browser-facing `session_updated` message carrying one `RelaySessionSummaryMessage`
+  - track browser user identity in live websocket connections so updates respect session ownership visibility
+  - broadcast summary changes for meaningful status transitions, not for every output chunk
+- Invariants:
+  - browser session visibility must continue to respect authenticated owner scoping
+  - `session_list` remains the full-sync path; `session_updated` is incremental
+  - output streaming remains on the existing `output_chunk` channel
+- Likely files/modules to change:
+  - `PLANS.md`
+  - `src/protocol.rs`
+  - `src/relay_server.rs`
+  - `src/relay_console.html`
+- Verification steps:
+  - run `cargo fmt`
+  - run `cargo check`
+  - run `cargo test`
+  - run `cargo clippy --all-targets --all-features -- -D warnings`
+  - inspect browser flow for create -> running -> awaiting_permission -> idle -> device_disconnected without manual refresh
+- Main risks:
+  - over-broadcasting updates for non-owner sessions
+  - forgetting a summary mutation path and leaving the browser list stale
+  - turning high-frequency events into unnecessary session-list churn
+
+### Follow-up: Browser Session Removed Broadcast
+
+- Goal: remove sessions from browser-side incremental state when session visibility shrinks, especially when a legacy ownerless session is claimed by one authenticated user.
+- Scope:
+  - add a browser-facing `session_removed` message carrying the logical session id
+  - compare previous vs current visibility when ownership changes and notify browsers that lose access
+  - keep full `session_list` as the recovery path, but stop relying on it for owner-claim cleanup
+- Invariants:
+  - browsers must never retain stale sessions they no longer have permission to access
+  - visibility expansion should still use `session_updated`
+  - no output-stream behavior should depend on `session_removed`
+- Likely files/modules to change:
+  - `PLANS.md`
+  - `src/protocol.rs`
+  - `src/relay_server.rs`
+  - `src/relay_console.html`
+- Verification steps:
+  - run `cargo fmt`
+  - run `cargo check`
+  - run `cargo test`
+  - run `cargo clippy --all-targets --all-features -- -D warnings`
+  - inspect ownerless-session adopt flow to confirm the claiming browser keeps the session while other browsers drop it without a full refresh
+- Main risks:
+  - missing one visibility-shrinking path and leaving stale UI state
+  - over-generalizing removal logic before actual session deletion exists
+
+### Follow-up: Session Closed And Delete Flow
+
+- Goal: add an explicit logical close state for relay sessions plus a real relay-side delete flow that removes summary, bindings, and persisted history.
+- Scope:
+  - add browser commands for `close_session` and `delete_session`
+  - add browser events for `session_closed` and reuse `session_removed` for delete
+  - close should mark the relay session read-only and attempt ACP prompt cancellation when applicable
+  - delete should require a closed session and remove relay metadata, routing state, pending permissions, and history events
+- Invariants:
+  - closed sessions remain readable via history but must reject new prompts
+  - delete is relay-side deletion; it must stop future resume/rebind for that session
+  - the implementation must not pretend it can hard-delete ACP-internal state that the current ACP API does not expose
+- Likely files/modules to change:
+  - `PLANS.md`
+  - `src/protocol.rs`
+  - `src/types.rs`
+  - `src/runtime.rs`
+  - `src/transport.rs`
+  - `src/relay_server.rs`
+  - `src/relay_console.html`
+- Verification steps:
+  - run `cargo fmt`
+  - run `cargo check`
+  - run `cargo test`
+  - run `cargo clippy --all-targets --all-features -- -D warnings`
+  - inspect browser flow for close -> session becomes read-only -> delete removes it from list and history API returns unknown session
+- Main risks:
+  - close racing with in-flight prompt updates and accidentally reopening the session status
+  - forgetting to scrub pending permission state on close/delete
+  - making delete too permissive and removing sessions that are still active
+
+### Follow-up: Delete Audit And Browser Confirmation
+
+- Goal: preserve a relay-wide `session_deleted` audit trail while reducing accidental close/delete actions in the browser console.
+- Scope:
+  - keep a `session_deleted` event in the persisted relay event log even after per-session history is deleted
+  - add browser confirmation dialogs before `close_session` and `delete_session`
+  - keep delete semantics unchanged: session-local history is removed, audit event remains global
+- Invariants:
+  - deleting a session must still remove that session's own history from `get_session_history`
+  - the audit event must not resurrect the deleted session in session history reads
+  - browser confirmations should be client-side only and not change server auth semantics
+- Likely files/modules to change:
+  - `PLANS.md`
+  - `src/relay_server.rs`
+  - `src/relay_console.html`
+- Verification steps:
+  - run `cargo fmt`
+  - run `cargo check`
+  - run `cargo test`
+  - run `cargo clippy --all-targets --all-features -- -D warnings`
+  - inspect delete flow to confirm the session disappears from browser/history while the relay event log retains `session_deleted`
+- Main risks:
+  - accidentally retaining deleted session events in history pagination
+  - adding an audit event shape that is too vague to be useful later
+
 ## 2026-03-20 Caddy Browser Authentication
 
 - Goal: protect browser/PWA access behind Caddy-authenticated requests while teaching the relay server to trust and enforce authenticated browser identity.
@@ -257,3 +398,67 @@
   - locking out the PWA shell if auth is enforced too aggressively on static assets
   - leaving legacy persisted sessions inaccessible or globally visible after user scoping is introduced
   - documenting a Caddy pattern that drifts from the relay server's actual header expectations
+
+## 2026-03-22 Auth Hardening, TLS Enforcement, Reconnect Backoff, And XSS Fixes
+
+Status: completed
+
+- Goal: harden production readiness by closing obvious auth gaps, enforcing secure relay transport defaults, improving reconnect behavior, and removing DOM XSS sinks in the relay console.
+- Scope:
+  - enforce secure relay URL defaults (`wss://`) for the home client while keeping an explicit local-development override
+  - harden relay-server auth defaults so browser auth and client token checks are required unless explicitly disabled for local development
+  - add exponential backoff with jitter for home-client reconnect and browser websocket auto-reconnect
+  - replace `innerHTML` render paths that interpolate runtime data with safe DOM text-node rendering
+  - refresh docs/examples for new auth and transport environment knobs
+- Invariants:
+  - Caddy remains the TLS terminator and relay server can stay bound to localhost
+  - home-client and browser auth checks remain separate concerns
+  - relay runtime/session protocol behavior remains backward-compatible beyond transport/auth validation
+  - reconnect loops must not create tight retry storms when network is unstable
+- Likely files/modules to change:
+  - `PLANS.md`
+  - `src/config.rs`
+  - `src/main.rs`
+  - `src/relay_server.rs`
+  - `src/relay_console.html`
+  - `docs/caddy-auth.md`
+  - `deploy/Caddyfile.example`
+- Verification steps:
+  - run `cargo fmt`
+  - run `cargo check`
+  - run `cargo test`
+  - run `cargo clippy --all-targets --all-features -- -D warnings`
+  - inspect browser websocket reconnect behavior and confirm dynamic list rendering no longer uses `innerHTML` for untrusted data
+- Main risks:
+  - making secure defaults too strict and surprising existing local/dev usage
+  - introducing reconnect jitter bugs that delay recovery more than expected
+  - missing a remaining `innerHTML` sink in the UI code
+
+## 2026-03-22 Service Templates And Env Files
+
+Status: completed
+
+- Goal: provide ready-to-customize deployment templates for `systemd`, `launchd`, and environment files for both relay server and home client.
+- Scope:
+  - add `systemd` unit templates for `relay_server` and `codex_master` (home client)
+  - add `launchd` plist templates for relay server and home client
+  - add `.env` example files containing strict-mode auth and reconnect knobs
+  - keep all artifacts under `deploy/` without changing runtime Rust logic
+- Invariants:
+  - templates must default to secure relay deployment assumptions (Caddy TLS termination + strict auth)
+  - env examples should align with currently implemented runtime variables
+  - placeholders should be explicit and easy to replace per host
+- Likely files/modules to change:
+  - `PLANS.md`
+  - `deploy/systemd/codex-relay.service`
+  - `deploy/systemd/codex-home-client.service`
+  - `deploy/launchd/com.codex.relay-server.plist`
+  - `deploy/launchd/com.codex.home-client.plist`
+  - `deploy/env/relay.env.example`
+  - `deploy/env/home-client.env.example`
+- Verification steps:
+  - inspect templates for variable and path consistency
+  - ensure service/unit syntax is structurally valid plain text (no placeholders breaking parsers)
+- Main risks:
+  - ambiguous placeholder paths causing copy-paste deployment mistakes
+  - mismatch between env templates and current strict-mode auth requirements

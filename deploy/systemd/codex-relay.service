@@ -1,0 +1,23 @@
+[Unit]
+Description=Codex Relay Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=codex
+Group=codex
+WorkingDirectory=/var/lib/codex-master/relay
+EnvironmentFile=/etc/codex-master/relay.env
+ExecStart=/usr/local/bin/relay_server
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/codex-master/relay /var/log/codex-master
+StandardOutput=append:/var/log/codex-master/relay-server.log
+StandardError=append:/var/log/codex-master/relay-server.log
+
+[Install]
+WantedBy=multi-user.target
