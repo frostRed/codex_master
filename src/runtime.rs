@@ -2,10 +2,10 @@ use crate::config::WorkspaceConfig;
 use crate::transport::ClientTransport;
 use crate::types::{HomeClientCommand, HomeClientEvent, PermissionOptionView, WorkspaceView};
 use agent_client_protocol::{
-    Agent, Client, ClientSideConnection, ContentBlock, Implementation, InitializeRequest,
-    NewSessionRequest, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome, SessionId,
-    SessionNotification, SessionUpdate,
+    Agent, CancelNotification, Client, ClientSideConnection, ContentBlock, Implementation,
+    InitializeRequest, NewSessionRequest, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
+    SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate,
 };
 use anyhow::{Context, Result};
 use std::cell::RefCell;
@@ -51,6 +51,16 @@ struct RuntimeClientState {
 #[derive(Clone)]
 struct RuntimeClient {
     state: Rc<RefCell<RuntimeClientState>>,
+}
+
+struct RuntimeContext<'a> {
+    workspaces: &'a [WorkspaceConfig],
+    default_workspace_id: &'a str,
+    agent: Rc<ClientSideConnection>,
+    runtime_client: RuntimeClient,
+    internal_tx: mpsc::UnboundedSender<InternalEvent>,
+    sessions: &'a mut HashMap<String, SessionId>,
+    prompt_in_flight: &'a mut bool,
 }
 
 impl RuntimeClient {
@@ -253,17 +263,17 @@ pub async fn run_home_client<T: ClientTransport>(
                     break;
                 };
 
-                if !handle_command(
-                    &mut transport,
-                    &workspaces,
-                    &default_workspace_id,
-                    agent.clone(),
-                    runtime_client.clone(),
-                    internal_tx.clone(),
-                    &mut sessions,
-                    &mut prompt_in_flight,
-                    command,
-                ).await? {
+                let mut context = RuntimeContext {
+                    workspaces: &workspaces,
+                    default_workspace_id: &default_workspace_id,
+                    agent: agent.clone(),
+                    runtime_client: runtime_client.clone(),
+                    internal_tx: internal_tx.clone(),
+                    sessions: &mut sessions,
+                    prompt_in_flight: &mut prompt_in_flight,
+                };
+
+                if !handle_command(&mut transport, &mut context, command).await? {
                     break;
                 }
             }
@@ -285,13 +295,7 @@ pub async fn run_home_client<T: ClientTransport>(
 
 async fn handle_command<T: ClientTransport>(
     transport: &mut T,
-    workspaces: &[WorkspaceConfig],
-    default_workspace_id: &str,
-    agent: Rc<ClientSideConnection>,
-    runtime_client: RuntimeClient,
-    internal_tx: mpsc::UnboundedSender<InternalEvent>,
-    sessions: &mut HashMap<String, SessionId>,
-    prompt_in_flight: &mut bool,
+    context: &mut RuntimeContext<'_>,
     command: HomeClientCommand,
 ) -> Result<bool> {
     match command {
@@ -300,20 +304,51 @@ async fn handle_command<T: ClientTransport>(
             workspace_id,
         } => {
             let workspace = resolve_workspace(
-                workspaces,
+                context.workspaces,
                 workspace_id.as_deref(),
-                Some(default_workspace_id),
+                Some(context.default_workspace_id),
             )?;
-            let acp_session_id = create_session(agent.as_ref(), workspace).await?;
+            let acp_session_id = create_session(context.agent.as_ref(), workspace).await?;
             let session_ref = session_id.unwrap_or_else(|| acp_session_id.to_string());
-            sessions.insert(session_ref.clone(), acp_session_id);
+            context
+                .sessions
+                .insert(session_ref.clone(), acp_session_id.clone());
             transport
                 .publish_event(HomeClientEvent::SessionCreated {
                     session_id: session_ref,
+                    client_session_id: acp_session_id.to_string(),
                     workspace_id: workspace.id.clone(),
                     workspace_name: workspace.name.clone(),
                 })
                 .await?;
+            Ok(true)
+        }
+        HomeClientCommand::ResumeSession {
+            session_id,
+            client_session_id,
+            workspace_id,
+        } => {
+            let workspace = resolve_workspace(context.workspaces, Some(&workspace_id), None)?;
+            match resume_session(context.agent.as_ref(), workspace, &client_session_id).await {
+                Ok(acp_session_id) => {
+                    context.sessions.insert(session_id.clone(), acp_session_id);
+                    transport
+                        .publish_event(HomeClientEvent::SessionResumed {
+                            session_id,
+                            client_session_id,
+                        })
+                        .await?;
+                }
+                Err(err) => {
+                    transport
+                        .publish_event(HomeClientEvent::SessionResumeFailed {
+                            session_id,
+                            client_session_id,
+                            message: err.to_string(),
+                        })
+                        .await?;
+                }
+            }
             Ok(true)
         }
         HomeClientCommand::Prompt {
@@ -321,7 +356,7 @@ async fn handle_command<T: ClientTransport>(
             text,
             create_session_if_missing,
         } => {
-            if *prompt_in_flight {
+            if *context.prompt_in_flight {
                 transport
                     .publish_event(HomeClientEvent::Error {
                         message: "当前已有一个进行中的 prompt，请等待完成后再发送。".to_string(),
@@ -332,10 +367,10 @@ async fn handle_command<T: ClientTransport>(
 
             let (session_ref, session_id) = match resolve_session(
                 transport,
-                workspaces,
-                default_workspace_id,
-                agent.as_ref(),
-                sessions,
+                context.workspaces,
+                context.default_workspace_id,
+                context.agent.as_ref(),
+                context.sessions,
                 session_id,
                 create_session_if_missing,
             )
@@ -345,11 +380,12 @@ async fn handle_command<T: ClientTransport>(
                 None => return Ok(true),
             };
 
-            *prompt_in_flight = true;
-            runtime_client.begin_prompt(&session_ref);
+            *context.prompt_in_flight = true;
+            context.runtime_client.begin_prompt(&session_ref);
 
-            let agent = agent.clone();
-            let runtime_client = runtime_client.clone();
+            let agent = context.agent.clone();
+            let runtime_client = context.runtime_client.clone();
+            let internal_tx = context.internal_tx.clone();
             tokio::task::spawn_local(async move {
                 let prompt_result = agent
                     .prompt(PromptRequest::new(session_id, vec![text.into()]))
@@ -379,7 +415,9 @@ async fn handle_command<T: ClientTransport>(
             request_id,
             selected_index,
         } => {
-            let resolved = runtime_client.resolve_permission(&request_id, selected_index);
+            let resolved = context
+                .runtime_client
+                .resolve_permission(&request_id, selected_index);
             if !resolved {
                 transport
                     .publish_event(HomeClientEvent::Error {
@@ -387,6 +425,23 @@ async fn handle_command<T: ClientTransport>(
                     })
                     .await?;
             }
+            Ok(true)
+        }
+        HomeClientCommand::CancelSession { session_id } => {
+            let Some(acp_session_id) = context.sessions.get(&session_id).cloned() else {
+                transport
+                    .publish_event(HomeClientEvent::Error {
+                        message: format!("未找到可取消的 session: {session_id}"),
+                    })
+                    .await?;
+                return Ok(true);
+            };
+
+            context
+                .agent
+                .cancel(CancelNotification::new(acp_session_id))
+                .await
+                .with_context(|| format!("取消会话失败: {session_id}"))?;
             Ok(true)
         }
         HomeClientCommand::Exit => Ok(false),
@@ -488,6 +543,7 @@ async fn resolve_session<T: ClientTransport>(
     transport
         .publish_event(HomeClientEvent::SessionCreated {
             session_id: session_ref.clone(),
+            client_session_id: session_id.to_string(),
             workspace_id: workspace.id.clone(),
             workspace_name: workspace.name.clone(),
         })
@@ -514,6 +570,22 @@ async fn create_session(
         .await
         .context("创建会话失败")?;
     Ok(response.session_id)
+}
+
+async fn resume_session(
+    agent: &ClientSideConnection,
+    workspace: &WorkspaceConfig,
+    client_session_id: &str,
+) -> Result<SessionId> {
+    let session_id = SessionId::new(client_session_id.to_string());
+    agent
+        .resume_session(ResumeSessionRequest::new(
+            session_id.clone(),
+            &workspace.path,
+        ))
+        .await
+        .with_context(|| format!("恢复会话失败: {client_session_id}"))?;
+    Ok(session_id)
 }
 
 fn resolve_workspace<'a>(

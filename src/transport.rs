@@ -33,6 +33,12 @@ pub struct LocalDebugTransport {
     command_rx: mpsc::UnboundedReceiver<HomeClientCommand>,
 }
 
+impl Default for LocalDebugTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LocalDebugTransport {
     pub fn new() -> Self {
         let state = Rc::new(RefCell::new(LocalDebugState::default()));
@@ -98,12 +104,31 @@ impl ClientTransport for LocalDebugTransport {
             }
             HomeClientEvent::SessionCreated {
                 session_id,
+                client_session_id,
                 workspace_id,
                 workspace_name,
             } => {
                 let mut state = self.state.borrow_mut();
                 state.active_session = Some(session_id.clone());
-                println!("[session] {session_id} workspace={workspace_name} ({workspace_id})");
+                println!(
+                    "[session] {session_id} workspace={workspace_name} ({workspace_id}) acp={client_session_id}"
+                );
+            }
+            HomeClientEvent::SessionResumed {
+                session_id,
+                client_session_id,
+            } => {
+                self.state.borrow_mut().active_session = Some(session_id.clone());
+                println!("[session-resumed] {session_id} acp={client_session_id}");
+            }
+            HomeClientEvent::SessionResumeFailed {
+                session_id,
+                client_session_id,
+                message,
+            } => {
+                eprintln!(
+                    "[session-resume-failed] session={session_id} acp={client_session_id} error={message}"
+                );
             }
             HomeClientEvent::OutputChunk { session_id, text } => {
                 let mut state = self.state.borrow_mut();
@@ -305,10 +330,10 @@ impl RelayTransport {
                     Ok(Message::Text(text)) => {
                         match serde_json::from_str::<ServerToClientMessage>(text.as_ref()) {
                             Ok(message) => {
-                                if let Some(command) = map_server_message(message) {
-                                    if command_tx_for_reader.send(command).is_err() {
-                                        break;
-                                    }
+                                if let Some(command) = map_server_message(message)
+                                    && command_tx_for_reader.send(command).is_err()
+                                {
+                                    break;
                                 }
                             }
                             Err(err) => {
@@ -355,7 +380,7 @@ impl RelayTransport {
             while let Some(outbound) = outbound_rx.recv().await {
                 let message = match outbound {
                     RelayOutbound::Protocol(payload) => match serde_json::to_string(&payload) {
-                        Ok(text) => Message::Text(text.into()),
+                        Ok(text) => Message::Text(text),
                         Err(err) => {
                             eprintln!("[relay-serialize-error] {err}");
                             continue;
@@ -424,6 +449,15 @@ fn map_server_message(message: ServerToClientMessage) -> Option<HomeClientComman
             session_id: Some(session_id),
             workspace_id: Some(workspace_id),
         }),
+        ServerToClientMessage::ResumeSession {
+            session_id,
+            client_session_id,
+            workspace_id,
+        } => Some(HomeClientCommand::ResumeSession {
+            session_id,
+            client_session_id,
+            workspace_id,
+        }),
         ServerToClientMessage::Prompt {
             session_id,
             text,
@@ -440,6 +474,9 @@ fn map_server_message(message: ServerToClientMessage) -> Option<HomeClientComman
             request_id,
             selected_index,
         }),
+        ServerToClientMessage::CancelSession { session_id } => {
+            Some(HomeClientCommand::CancelSession { session_id })
+        }
         ServerToClientMessage::Shutdown => Some(HomeClientCommand::Exit),
         ServerToClientMessage::Ping => None,
     }
@@ -451,12 +488,30 @@ fn map_home_event(event: HomeClientEvent) -> ClientToServerMessage {
         HomeClientEvent::Info { message } => ClientToServerMessage::Info { message },
         HomeClientEvent::SessionCreated {
             session_id,
+            client_session_id,
             workspace_id,
             workspace_name,
         } => ClientToServerMessage::SessionCreated {
             session_id,
+            client_session_id,
             workspace_id,
             workspace_name,
+        },
+        HomeClientEvent::SessionResumed {
+            session_id,
+            client_session_id,
+        } => ClientToServerMessage::SessionResumed {
+            session_id,
+            client_session_id,
+        },
+        HomeClientEvent::SessionResumeFailed {
+            session_id,
+            client_session_id,
+            message,
+        } => ClientToServerMessage::SessionResumeFailed {
+            session_id,
+            client_session_id,
+            message,
         },
         HomeClientEvent::OutputChunk { session_id, text } => {
             ClientToServerMessage::OutputChunk { session_id, text }

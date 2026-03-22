@@ -10,6 +10,11 @@ pub enum HomeClientCommand {
         session_id: Option<String>,
         workspace_id: Option<String>,
     },
+    ResumeSession {
+        session_id: String,
+        client_session_id: String,
+        workspace_id: String,
+    },
     Prompt {
         session_id: Option<String>,
         text: String,
@@ -18,6 +23,9 @@ pub enum HomeClientCommand {
     ResolvePermission {
         request_id: String,
         selected_index: usize,
+    },
+    CancelSession {
+        session_id: String,
     },
     Exit,
 }
@@ -40,8 +48,18 @@ pub enum HomeClientEvent {
     },
     SessionCreated {
         session_id: String,
+        client_session_id: String,
         workspace_id: String,
         workspace_name: String,
+    },
+    SessionResumed {
+        session_id: String,
+        client_session_id: String,
+    },
+    SessionResumeFailed {
+        session_id: String,
+        client_session_id: String,
+        message: String,
     },
     OutputChunk {
         session_id: String,

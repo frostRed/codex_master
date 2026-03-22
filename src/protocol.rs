@@ -32,8 +32,18 @@ pub enum ClientToServerMessage {
     },
     SessionCreated {
         session_id: String,
+        client_session_id: String,
         workspace_id: String,
         workspace_name: String,
+    },
+    SessionResumed {
+        session_id: String,
+        client_session_id: String,
+    },
+    SessionResumeFailed {
+        session_id: String,
+        client_session_id: String,
+        message: String,
     },
     OutputChunk {
         session_id: String,
@@ -60,6 +70,11 @@ pub enum ServerToClientMessage {
         session_id: String,
         workspace_id: String,
     },
+    ResumeSession {
+        session_id: String,
+        client_session_id: String,
+        workspace_id: String,
+    },
     Prompt {
         session_id: Option<String>,
         text: String,
@@ -68,6 +83,9 @@ pub enum ServerToClientMessage {
     ResolvePermission {
         request_id: String,
         selected_index: usize,
+    },
+    CancelSession {
+        session_id: String,
     },
     Ping,
     Shutdown,
@@ -124,6 +142,12 @@ pub enum BrowserToServerMessage {
     AdoptSession {
         session_id: String,
     },
+    CloseSession {
+        session_id: String,
+    },
+    DeleteSession {
+        session_id: String,
+    },
     Prompt {
         session_id: String,
         text: String,
@@ -149,6 +173,12 @@ pub enum ServerToBrowserMessage {
     SessionList {
         sessions: Vec<RelaySessionSummaryMessage>,
     },
+    SessionUpdated {
+        session: RelaySessionSummaryMessage,
+    },
+    SessionRemoved {
+        session_id: String,
+    },
     SessionHistory {
         session_id: String,
         events: Vec<SessionEventMessage>,
@@ -163,6 +193,9 @@ pub enum ServerToBrowserMessage {
         device_id: String,
         workspace_id: String,
         workspace_name: String,
+    },
+    SessionClosed {
+        session_id: String,
     },
     OutputChunk {
         session_id: String,

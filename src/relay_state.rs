@@ -5,10 +5,18 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedRelaySession {
+    #[serde(flatten)]
+    pub summary: RelaySessionSummaryMessage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_session_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RelaySnapshot {
     pub devices: HashMap<String, DeviceStatusMessage>,
-    pub sessions: HashMap<String, RelaySessionSummaryMessage>,
+    pub sessions: HashMap<String, PersistedRelaySession>,
     #[serde(default)]
     pub checkpointed_through_seq: u64,
     #[serde(default, alias = "events")]
@@ -18,7 +26,7 @@ pub struct RelaySnapshot {
 #[derive(Debug, Clone, Default)]
 pub struct RelayStore {
     pub devices: HashMap<String, DeviceStatusMessage>,
-    pub sessions: HashMap<String, RelaySessionSummaryMessage>,
+    pub sessions: HashMap<String, PersistedRelaySession>,
     pub events: Vec<SessionEventMessage>,
     pub checkpointed_event_count: usize,
     pub checkpointed_through_seq: u64,
@@ -380,4 +388,36 @@ pub fn unix_timestamp_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_snapshot_deserializes_without_client_session_id() {
+        let snapshot = serde_json::from_str::<RelaySnapshot>(
+            r#"{
+                "devices": {},
+                "sessions": {
+                    "relay-session-1": {
+                        "session_id": "relay-session-1",
+                        "device_id": "device-1",
+                        "status": "idle",
+                        "created_at": 1,
+                        "updated_at": 2
+                    }
+                }
+            }"#,
+        )
+        .expect("legacy snapshot should deserialize");
+
+        let session = snapshot
+            .sessions
+            .get("relay-session-1")
+            .expect("session should exist");
+        assert_eq!(session.summary.session_id, "relay-session-1");
+        assert_eq!(session.summary.device_id, "device-1");
+        assert_eq!(session.client_session_id, None);
+    }
 }
