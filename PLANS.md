@@ -471,8 +471,9 @@ Status: completed
 - Scope:
   - extend relay-server client auth from single token to token set + revoked token set
   - remove legacy single-token fallback compatibility so production config has one unambiguous token source
+  - add relay-native local login mode (`/login` + cookie session) for deployments that do not want proxy-injected identity headers
   - require explicit browser origin allowlist in strict mode and enforce it on browser HTTP/WS requests
-  - make unauthenticated/anonymous browser mode explicitly opt-in and dev-only
+  - remove unauthenticated/anonymous browser mode from production paths
   - update deployment env examples/docs to reflect the new production auth knobs
 - Invariants:
   - strict mode remains default for production
@@ -495,3 +496,33 @@ Status: completed
   - over-restricting origin validation and blocking legitimate production domains
   - misconfigured token lists causing home-client lockout during rotation
   - introducing auth regressions for local loopback debug mode
+
+## 2026-03-22 Built-in Relay Login Only
+
+Status: completed
+
+- Goal: make relay browser auth rely on built-in login sessions only, so `/` and `/ws/browser` always require relay-managed cookie auth.
+- Scope:
+  - remove browser proxy-header auth mode and related runtime configuration dependencies
+  - keep single-account username/password login flow as the current production path
+  - ensure unauthenticated HTTP access redirects to `/login` and unauthenticated browser websocket upgrades are rejected
+  - update deployment env examples and docs to remove proxy-header instructions
+- Invariants:
+  - home client authentication remains token-based and unchanged
+  - browser origin allowlist enforcement remains intact in strict mode
+  - existing relay session ownership checks continue to use authenticated user id from login session
+- Likely files/modules to change:
+  - `PLANS.md`
+  - `src/relay_server.rs`
+  - `deploy/env/relay.env.example`
+  - `deploy/Caddyfile.example`
+  - `docs/caddy-auth.md`
+- Verification steps:
+  - run `cargo fmt`
+  - run `cargo check`
+  - run `cargo test`
+  - run `cargo clippy --all-targets --all-features -- -D warnings`
+  - manually inspect browser auth code paths for `/`, `/login`, and `/ws/browser`
+- Main risks:
+  - accidentally breaking existing deployments that still set proxy-header env vars
+  - introducing login regressions around cookie handling or session expiry

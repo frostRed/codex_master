@@ -14,14 +14,11 @@ relay.example.com {
         reverse_proxy 127.0.0.1:8080
     }
 
-    # Optional: keep this block if you want Caddy-managed auth.
-    # If your upstream app auth already guards this endpoint, you can remove it.
+    # Optional defense-in-depth.
+    # Relay already enforces its own /login + cookie session auth.
     basic_auth {
         {$RELAY_BASIC_AUTH_USER} {$RELAY_BASIC_AUTH_PASSWORD_HASH}
     }
 
-    reverse_proxy 127.0.0.1:8080 {
-        header_up X-Relay-User {http.auth.user.id}
-        header_up X-Relay-Auth-Secret {$RELAY_BROWSER_PROXY_SECRET}
-    }
+    reverse_proxy 127.0.0.1:8080
 }

@@ -1,33 +1,41 @@
-# Upstream Browser Auth
+# Relay Browser Authentication
 
-This relay server can trust browser identity headers injected by a reverse proxy or upstream gateway (Caddy, Nginx, app gateway, etc.).
+Relay browser access now uses relay-managed login sessions only:
+
+- relay serves `GET /login` and `POST /auth/login`
+- relay sets an HttpOnly session cookie after successful login
+- unauthenticated browser access to `/` is redirected to `/login`
+- unauthenticated `GET /ws/browser` is rejected with `401`
+
+Proxy-injected identity-header auth is no longer used by relay.
 
 ## Relay Server Environment
 
-Set these on the relay server:
+Set these values on the relay server:
 
 ```bash
 export RELAY_SERVER_BIND=127.0.0.1:8080
 export RELAY_SERVER_CLIENT_TOKENS='token-v1,token-v2'
 export RELAY_SERVER_CLIENT_TOKENS_REVOKED=''
-export RELAY_SERVER_BROWSER_AUTH_REQUIRED=true
-export RELAY_SERVER_BROWSER_AUTH_USER_HEADER=X-Relay-User
-export RELAY_SERVER_BROWSER_AUTH_PROXY_SECRET_HEADER=X-Relay-Auth-Secret
-export RELAY_SERVER_BROWSER_AUTH_PROXY_SECRET='replace-with-a-random-secret'
 export RELAY_SERVER_BROWSER_ALLOWED_ORIGINS='https://relay.example.com'
-export RELAY_SERVER_BROWSER_ALLOW_ANONYMOUS=false
+
+export RELAY_SERVER_LOGIN_USERNAME='admin'
+export RELAY_SERVER_LOGIN_PASSWORD='replace-with-a-strong-password'
+export RELAY_SERVER_LOGIN_SESSION_TTL_SECS=86400
+export RELAY_SERVER_LOGIN_COOKIE_NAME='relay_session'
+export RELAY_SERVER_LOGIN_COOKIE_SECURE=true
 ```
 
 Notes:
 
 - Keep the relay server bound to localhost when a reverse proxy is in front of it.
-- In strict mode (default), client tokens, browser auth, proxy secret, and browser origin allowlist are required.
+- In strict mode (default), client token allowlist and browser origin allowlist are required.
 - `RELAY_SERVER_ALLOW_INSECURE_DEV=true` can relax auth checks only for loopback local development; it is rejected for non-loopback bind addresses.
 - Token revocation takes precedence over allowlist when a token appears in both `RELAY_SERVER_CLIENT_TOKENS` and `RELAY_SERVER_CLIENT_TOKENS_REVOKED`.
 
 ## Home Client
 
-Home client traffic is unchanged by browser auth. Use the relay URL over TLS:
+Home client traffic is unchanged by browser login auth. Use the relay URL over TLS:
 
 ```bash
 export HOME_CLIENT_TRANSPORT=relay
@@ -51,16 +59,11 @@ export HOME_CLIENT_RECONNECT_JITTER_MILLIS=750
 export HOME_CLIENT_RECONNECT_RESET_AFTER_SECS=30
 ```
 
-## No Caddy Basic Auth
+## Caddy Integration
 
-If your own application gateway already authenticates users, you can remove Caddy `basic_auth`.
+Caddy only needs to terminate TLS and proxy to relay. Do not inject identity headers for relay auth.
 
-Requirements still remain:
-
-- gateway must inject trusted user header (`RELAY_SERVER_BROWSER_AUTH_USER_HEADER`)
-- gateway must inject proxy secret header (`RELAY_SERVER_BROWSER_AUTH_PROXY_SECRET_HEADER`)
-- browser websocket `Origin` must match `RELAY_SERVER_BROWSER_ALLOWED_ORIGINS`
-- relay server should stay on loopback and only be reachable through the proxy
+Optional `basic_auth` in Caddy can still be used as an extra outer layer, but relay login remains required for browser session access.
 
 ## Browser Flow
 
@@ -73,8 +76,8 @@ When browser auth is enabled:
 - `GET /icons/*`
 - `GET /ws/browser`
 
-all require the trusted browser auth headers.
+all require a valid relay login session cookie.
 
-The relay server stores the authenticated browser user id on newly created relay sessions so session lists and adoption are no longer globally shared across authenticated users.
+The relay server stores the authenticated login user id on newly created relay sessions so session lists and adoption are no longer globally shared across users.
 
 Legacy persisted sessions without an owner remain visible until one authenticated user adopts them, at which point ownership is claimed.

@@ -9,15 +9,17 @@ use anyhow::{Context, Result, anyhow};
 use axum::{
     Router,
     extract::{
-        State,
+        Json, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::Html,
+    response::Redirect,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
@@ -33,20 +35,36 @@ use tokio::{
 };
 
 #[derive(Debug, Clone)]
+struct LocalLoginAuthConfig {
+    username: String,
+    password: String,
+    session_ttl_secs: u64,
+    cookie_name: String,
+    cookie_secure: bool,
+}
+
+#[derive(Debug, Clone)]
+struct BrowserAuthConfig {
+    login: LocalLoginAuthConfig,
+    allowed_origins: HashSet<String>,
+}
+
+impl BrowserAuthConfig {
+    fn mode_name(&self) -> &'static str {
+        "local_login"
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct RelayServerConfig {
-    pub bind_addr: SocketAddr,
-    pub accepted_client_tokens: HashSet<String>,
-    pub revoked_client_tokens: HashSet<String>,
-    pub browser_auth_required: bool,
-    pub browser_auth_user_header: String,
-    pub browser_auth_proxy_secret: Option<String>,
-    pub browser_auth_proxy_secret_header: String,
-    pub browser_allowed_origins: HashSet<String>,
-    pub browser_allow_anonymous: bool,
-    pub allow_insecure_dev: bool,
-    pub state_file: PathBuf,
-    pub compaction_threshold: usize,
-    pub segment_event_limit: usize,
+    bind_addr: SocketAddr,
+    accepted_client_tokens: HashSet<String>,
+    revoked_client_tokens: HashSet<String>,
+    browser_auth: BrowserAuthConfig,
+    allow_insecure_dev: bool,
+    state_file: PathBuf,
+    compaction_threshold: usize,
+    segment_event_limit: usize,
 }
 
 impl RelayServerConfig {
@@ -62,24 +80,30 @@ impl RelayServerConfig {
             .unwrap_or(false);
         let accepted_client_tokens = parse_client_token_set()?;
         let revoked_client_tokens = parse_string_set_env("RELAY_SERVER_CLIENT_TOKENS_REVOKED")?;
-        let browser_auth_required = std::env::var("RELAY_SERVER_BROWSER_AUTH_REQUIRED")
-            .ok()
-            .map(|value| parse_bool_env("RELAY_SERVER_BROWSER_AUTH_REQUIRED", &value))
-            .transpose()?
-            .unwrap_or(true);
-        let browser_auth_user_header = std::env::var("RELAY_SERVER_BROWSER_AUTH_USER_HEADER")
-            .unwrap_or_else(|_| "X-Relay-User".to_string());
-        let browser_auth_proxy_secret =
-            optional_nonempty_env("RELAY_SERVER_BROWSER_AUTH_PROXY_SECRET")?;
-        let browser_auth_proxy_secret_header =
-            std::env::var("RELAY_SERVER_BROWSER_AUTH_PROXY_SECRET_HEADER")
-                .unwrap_or_else(|_| "X-Relay-Auth-Secret".to_string());
         let browser_allowed_origins = parse_origin_set_env("RELAY_SERVER_BROWSER_ALLOWED_ORIGINS")?;
-        let browser_allow_anonymous = std::env::var("RELAY_SERVER_BROWSER_ALLOW_ANONYMOUS")
+        let session_ttl_secs = std::env::var("RELAY_SERVER_LOGIN_SESSION_TTL_SECS")
             .ok()
-            .map(|value| parse_bool_env("RELAY_SERVER_BROWSER_ALLOW_ANONYMOUS", &value))
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(60 * 60 * 24)
+            .max(60);
+        let cookie_name = std::env::var("RELAY_SERVER_LOGIN_COOKIE_NAME")
+            .unwrap_or_else(|_| "relay_session".to_string());
+        let cookie_secure = std::env::var("RELAY_SERVER_LOGIN_COOKIE_SECURE")
+            .ok()
+            .map(|value| parse_bool_env("RELAY_SERVER_LOGIN_COOKIE_SECURE", &value))
             .transpose()?
-            .unwrap_or(false);
+            .unwrap_or(!allow_insecure_dev);
+        let browser_auth = BrowserAuthConfig {
+            login: LocalLoginAuthConfig {
+                username: required_nonempty_env("RELAY_SERVER_LOGIN_USERNAME")?,
+                password: required_nonempty_env("RELAY_SERVER_LOGIN_PASSWORD")?,
+                session_ttl_secs,
+                cookie_name,
+                cookie_secure,
+            },
+            allowed_origins: browser_allowed_origins.clone(),
+        };
+
         let state_file = std::env::var("RELAY_SERVER_STATE_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("relay-state.json"));
@@ -91,25 +115,19 @@ impl RelayServerConfig {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(100);
+
         validate_auth_configuration(
             bind_addr,
             allow_insecure_dev,
             &accepted_client_tokens,
-            browser_auth_required,
-            &browser_auth_proxy_secret,
-            &browser_allowed_origins,
-            browser_allow_anonymous,
+            &browser_auth,
         )?;
+
         Ok(Self {
             bind_addr,
             accepted_client_tokens,
             revoked_client_tokens,
-            browser_auth_required,
-            browser_auth_user_header,
-            browser_auth_proxy_secret,
-            browser_auth_proxy_secret_header,
-            browser_allowed_origins,
-            browser_allow_anonymous,
+            browser_auth,
             allow_insecure_dev,
             state_file,
             compaction_threshold,
@@ -132,6 +150,7 @@ struct ClientAuthConfig {
 struct InnerState {
     client_auth: ClientAuthConfig,
     browser_auth: BrowserAuthConfig,
+    login_sessions: Mutex<HashMap<String, BrowserLoginSession>>,
     persistence: RelayPersistence,
     next_browser_id: AtomicU64,
     next_session_id: AtomicU64,
@@ -171,13 +190,9 @@ struct PendingPermission {
 }
 
 #[derive(Debug, Clone)]
-struct BrowserAuthConfig {
-    required: bool,
-    user_header: String,
-    expected_proxy_secret: Option<String>,
-    proxy_secret_header: String,
-    allowed_origins: HashSet<String>,
-    allow_anonymous: bool,
+struct BrowserLoginSession {
+    user_id: String,
+    expires_at: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -236,14 +251,8 @@ impl AppState {
                     accepted_tokens: config.accepted_client_tokens,
                     revoked_tokens: config.revoked_client_tokens,
                 },
-                browser_auth: BrowserAuthConfig {
-                    required: config.browser_auth_required,
-                    user_header: config.browser_auth_user_header,
-                    expected_proxy_secret: config.browser_auth_proxy_secret,
-                    proxy_secret_header: config.browser_auth_proxy_secret_header,
-                    allowed_origins: config.browser_allowed_origins,
-                    allow_anonymous: config.browser_allow_anonymous,
-                },
+                browser_auth: config.browser_auth,
+                login_sessions: Mutex::new(HashMap::new()),
                 persistence,
                 next_browser_id: AtomicU64::new(1),
                 next_session_id: AtomicU64::new(next_session_counter),
@@ -300,6 +309,9 @@ impl AppState {
 pub async fn run(config: RelayServerConfig) -> Result<()> {
     let state = AppState::new(config.clone())?;
     let app = Router::new()
+        .route("/login", get(login_page))
+        .route("/auth/login", post(login_submit))
+        .route("/auth/logout", post(logout_submit))
         .route("/", get(debug_console))
         .route("/manifest.webmanifest", get(web_manifest))
         .route("/sw.js", get(service_worker))
@@ -316,7 +328,7 @@ pub async fn run(config: RelayServerConfig) -> Result<()> {
         .with_context(|| format!("绑定 relay server 地址失败: {}", config.bind_addr))?;
 
     println!(
-        "relay server listening on {} using snapshot {} and event dir {} (compaction threshold {}, segment limit {}, auth mode {})",
+        "relay server listening on {} using snapshot {} and event dir {} (compaction threshold {}, segment limit {}, security mode {}, browser auth {})",
         config.bind_addr,
         state.inner.persistence.snapshot_path().display(),
         state.inner.persistence.event_log_dir().display(),
@@ -326,7 +338,8 @@ pub async fn run(config: RelayServerConfig) -> Result<()> {
             "insecure-dev"
         } else {
             "strict"
-        }
+        },
+        config.browser_auth.mode_name()
     );
     axum::serve(listener, app)
         .await
@@ -338,8 +351,109 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
+#[derive(Debug, Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+async fn login_page(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if authenticate_browser_http_request(&state, &headers)
+        .await
+        .is_ok()
+    {
+        return Redirect::to("/").into_response();
+    }
+
+    (
+        [("cache-control", "no-cache")],
+        Html(include_str!("relay_login.html")),
+    )
+        .into_response()
+}
+
+async fn login_submit(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(payload): Json<LoginRequest>,
+) -> Response {
+    let config = &state.inner.browser_auth.login;
+
+    if let Err(response) = validate_browser_origin(&state.inner.browser_auth, &headers) {
+        return *response;
+    }
+
+    if payload.username != config.username || payload.password != config.password {
+        return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+    }
+
+    let token = uuid::Uuid::new_v4().to_string();
+    let expires_at = unix_timestamp_secs().saturating_add(config.session_ttl_secs);
+    {
+        let mut sessions = state.inner.login_sessions.lock().await;
+        sessions.insert(
+            token.clone(),
+            BrowserLoginSession {
+                user_id: config.username.clone(),
+                expires_at,
+            },
+        );
+    }
+
+    let cookie = match build_auth_cookie(
+        &config.cookie_name,
+        &token,
+        config.session_ttl_secs,
+        config.cookie_secure,
+    ) {
+        Ok(cookie) => cookie,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to build auth cookie: {err}"),
+            )
+                .into_response();
+        }
+    };
+
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response
+        .headers_mut()
+        .append(axum::http::header::SET_COOKIE, cookie);
+    response
+}
+
+async fn logout_submit(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    let config = &state.inner.browser_auth.login;
+    if let Err(response) = validate_browser_origin(&state.inner.browser_auth, &headers) {
+        return *response;
+    }
+
+    if let Some(session_token) = cookie_value(&headers, &config.cookie_name) {
+        let mut sessions = state.inner.login_sessions.lock().await;
+        sessions.remove(&session_token);
+    }
+
+    let clear_cookie = match build_expired_auth_cookie(&config.cookie_name, config.cookie_secure) {
+        Ok(cookie) => cookie,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to clear auth cookie: {err}"),
+            )
+                .into_response();
+        }
+    };
+
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response
+        .headers_mut()
+        .append(axum::http::header::SET_COOKIE, clear_cookie);
+    response
+}
+
 async fn debug_console(headers: HeaderMap, State(state): State<AppState>) -> Response {
-    if let Err(response) = ensure_browser_http_auth(&state, &headers) {
+    if let Err(response) = ensure_browser_http_auth(&state, &headers).await {
         return *response;
     }
 
@@ -351,7 +465,7 @@ async fn debug_console(headers: HeaderMap, State(state): State<AppState>) -> Res
 }
 
 async fn web_manifest(headers: HeaderMap, State(state): State<AppState>) -> Response {
-    if let Err(response) = ensure_browser_http_auth(&state, &headers) {
+    if let Err(response) = ensure_browser_http_auth(&state, &headers).await {
         return *response;
     }
 
@@ -366,7 +480,7 @@ async fn web_manifest(headers: HeaderMap, State(state): State<AppState>) -> Resp
 }
 
 async fn service_worker(headers: HeaderMap, State(state): State<AppState>) -> Response {
-    if let Err(response) = ensure_browser_http_auth(&state, &headers) {
+    if let Err(response) = ensure_browser_http_auth(&state, &headers).await {
         return *response;
     }
 
@@ -382,7 +496,7 @@ async fn service_worker(headers: HeaderMap, State(state): State<AppState>) -> Re
 }
 
 async fn app_icon(headers: HeaderMap, State(state): State<AppState>) -> Response {
-    if let Err(response) = ensure_browser_http_auth(&state, &headers) {
+    if let Err(response) = ensure_browser_http_auth(&state, &headers).await {
         return *response;
     }
 
@@ -397,7 +511,7 @@ async fn app_icon(headers: HeaderMap, State(state): State<AppState>) -> Response
 }
 
 async fn app_maskable_icon(headers: HeaderMap, State(state): State<AppState>) -> Response {
-    if let Err(response) = ensure_browser_http_auth(&state, &headers) {
+    if let Err(response) = ensure_browser_http_auth(&state, &headers).await {
         return *response;
     }
 
@@ -423,7 +537,7 @@ async fn browser_ws_handler(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let browser = match authenticate_browser_ws_request(&state, &headers) {
+    let browser = match authenticate_browser_ws_request(&state, &headers).await {
         Ok(browser) => browser,
         Err(response) => return *response,
     };
@@ -1813,6 +1927,10 @@ fn optional_nonempty_env(key: &str) -> Result<Option<String>> {
     }
 }
 
+fn required_nonempty_env(key: &str) -> Result<String> {
+    optional_nonempty_env(key)?.ok_or_else(|| anyhow!("缺少环境变量 {key}"))
+}
+
 fn parse_string_set_env(key: &str) -> Result<HashSet<String>> {
     let Ok(raw) = std::env::var(key) else {
         return Ok(HashSet::new());
@@ -1864,6 +1982,61 @@ fn normalize_origin(value: &str) -> Option<String> {
     Some(format!("{scheme}://{}", rest.to_ascii_lowercase()))
 }
 
+fn cookie_value(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
+    let cookie_header = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    for segment in cookie_header.split(';') {
+        let part = segment.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (name, value) = part.split_once('=')?;
+        if name.trim() == cookie_name {
+            return Some(value.trim().to_string());
+        }
+    }
+    None
+}
+
+fn validate_browser_origin(
+    auth: &BrowserAuthConfig,
+    headers: &HeaderMap,
+) -> std::result::Result<(), Box<Response>> {
+    if auth.allowed_origins.is_empty() {
+        return Ok(());
+    }
+
+    let Some(origin_header) = header_value(headers, "Origin") else {
+        return Err(unauthorized_response("browser origin header missing"));
+    };
+    let Some(origin) = normalize_origin(&origin_header) else {
+        return Err(unauthorized_response("browser origin header invalid"));
+    };
+    if !auth.allowed_origins.contains(&origin) {
+        return Err(unauthorized_response("browser origin not allowed"));
+    }
+
+    Ok(())
+}
+
+fn build_auth_cookie(
+    cookie_name: &str,
+    token: &str,
+    max_age_secs: u64,
+    secure: bool,
+) -> Result<HeaderValue> {
+    let secure_flag = if secure { "; Secure" } else { "" };
+    let value = format!(
+        "{cookie_name}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_secs}{secure_flag}"
+    );
+    HeaderValue::from_str(&value).context("构建登录 cookie 失败")
+}
+
+fn build_expired_auth_cookie(cookie_name: &str, secure: bool) -> Result<HeaderValue> {
+    let secure_flag = if secure { "; Secure" } else { "" };
+    let value = format!("{cookie_name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure_flag}");
+    HeaderValue::from_str(&value).context("构建退出登录 cookie 失败")
+}
+
 fn is_client_token_allowed(auth: &ClientAuthConfig, token: &str) -> bool {
     if auth.revoked_tokens.contains(token) {
         return false;
@@ -1878,22 +2051,8 @@ fn validate_auth_configuration(
     bind_addr: SocketAddr,
     allow_insecure_dev: bool,
     accepted_client_tokens: &HashSet<String>,
-    browser_auth_required: bool,
-    browser_auth_proxy_secret: &Option<String>,
-    browser_allowed_origins: &HashSet<String>,
-    browser_allow_anonymous: bool,
+    browser_auth: &BrowserAuthConfig,
 ) -> Result<()> {
-    if browser_allow_anonymous && browser_auth_required {
-        return Err(anyhow!(
-            "RELAY_SERVER_BROWSER_ALLOW_ANONYMOUS=true 不能和 RELAY_SERVER_BROWSER_AUTH_REQUIRED=true 同时开启"
-        ));
-    }
-    if browser_auth_required && browser_auth_proxy_secret.is_none() {
-        return Err(anyhow!(
-            "开启 RELAY_SERVER_BROWSER_AUTH_REQUIRED 时必须设置 RELAY_SERVER_BROWSER_AUTH_PROXY_SECRET"
-        ));
-    }
-
     if allow_insecure_dev {
         if !bind_addr.ip().is_loopback() {
             return Err(anyhow!(
@@ -1908,25 +2067,18 @@ fn validate_auth_configuration(
             "缺少 RELAY_SERVER_CLIENT_TOKENS；生产模式必须启用 home client token 认证"
         ));
     }
-    if !browser_auth_required {
-        return Err(anyhow!(
-            "生产模式必须启用 RELAY_SERVER_BROWSER_AUTH_REQUIRED=true；仅本地开发可使用 RELAY_SERVER_ALLOW_INSECURE_DEV=true 关闭"
-        ));
-    }
-    if browser_auth_proxy_secret.is_none() {
-        return Err(anyhow!(
-            "生产模式必须设置 RELAY_SERVER_BROWSER_AUTH_PROXY_SECRET 以防止伪造浏览器身份头"
-        ));
-    }
-    if browser_allowed_origins.is_empty() {
+    if browser_auth.allowed_origins.is_empty() {
         return Err(anyhow!(
             "生产模式必须设置 RELAY_SERVER_BROWSER_ALLOWED_ORIGINS（逗号分隔）用于浏览器 Origin 校验"
         ));
     }
-    if browser_allow_anonymous {
-        return Err(anyhow!(
-            "生产模式不允许 RELAY_SERVER_BROWSER_ALLOW_ANONYMOUS=true"
-        ));
+
+    let config = &browser_auth.login;
+    if config.username.trim().is_empty() {
+        return Err(anyhow!("RELAY_SERVER_LOGIN_USERNAME 不能为空"));
+    }
+    if config.password.trim().is_empty() {
+        return Err(anyhow!("RELAY_SERVER_LOGIN_PASSWORD 不能为空"));
     }
 
     Ok(())
@@ -1940,73 +2092,58 @@ fn parse_bool_env(key: &str, value: &str) -> Result<bool> {
     }
 }
 
-fn authenticate_browser_ws_request(
+async fn authenticate_browser_ws_request(
     state: &AppState,
     headers: &HeaderMap,
 ) -> std::result::Result<AuthenticatedBrowser, Box<Response>> {
-    authenticate_browser_request(state, headers, true)
+    authenticate_browser_request(state, headers, true).await
 }
 
-fn authenticate_browser_http_request(
+async fn authenticate_browser_http_request(
     state: &AppState,
     headers: &HeaderMap,
 ) -> std::result::Result<AuthenticatedBrowser, Box<Response>> {
-    authenticate_browser_request(state, headers, false)
+    authenticate_browser_request(state, headers, false).await
 }
 
-fn authenticate_browser_request(
+async fn authenticate_browser_request(
     state: &AppState,
     headers: &HeaderMap,
     enforce_origin: bool,
 ) -> std::result::Result<AuthenticatedBrowser, Box<Response>> {
     let auth = &state.inner.browser_auth;
-    if enforce_origin && !auth.allowed_origins.is_empty() {
-        let Some(origin_header) = header_value(headers, "Origin") else {
-            return Err(unauthorized_response("browser origin header missing"));
-        };
-        let Some(origin) = normalize_origin(&origin_header) else {
-            return Err(unauthorized_response("browser origin header invalid"));
-        };
-        if !auth.allowed_origins.contains(&origin) {
-            return Err(unauthorized_response("browser origin not allowed"));
-        }
+    if enforce_origin {
+        validate_browser_origin(auth, headers)?;
     }
 
-    if !auth.required {
-        if auth.allow_anonymous {
-            return Ok(AuthenticatedBrowser {
-                user_id: "anonymous".to_string(),
-            });
-        }
-        return Err(unauthorized_response(
-            "browser auth disabled without anonymous mode",
-        ));
-    }
-
-    if let Some(expected_proxy_secret) = auth.expected_proxy_secret.as_deref() {
-        let provided_secret = header_value(headers, &auth.proxy_secret_header);
-        if provided_secret.as_deref() != Some(expected_proxy_secret) {
-            return Err(unauthorized_response(
-                "browser auth proxy secret missing or invalid",
-            ));
-        }
-    }
-
-    let Some(user_id) = header_value(headers, &auth.user_header) else {
-        return Err(unauthorized_response("browser user header missing"));
+    let config = &auth.login;
+    let Some(session_token) = cookie_value(headers, &config.cookie_name) else {
+        return Err(unauthorized_response("browser login session missing"));
     };
-    if user_id.trim().is_empty() {
-        return Err(unauthorized_response("browser user header empty"));
+
+    let now = unix_timestamp_secs();
+    let mut login_sessions = state.inner.login_sessions.lock().await;
+    let Some(session) = login_sessions.get(&session_token).cloned() else {
+        return Err(unauthorized_response("browser login session invalid"));
+    };
+    if session.expires_at <= now {
+        login_sessions.remove(&session_token);
+        return Err(unauthorized_response("browser login session expired"));
     }
 
-    Ok(AuthenticatedBrowser { user_id })
+    Ok(AuthenticatedBrowser {
+        user_id: session.user_id,
+    })
 }
 
-fn ensure_browser_http_auth(
+async fn ensure_browser_http_auth(
     state: &AppState,
     headers: &HeaderMap,
 ) -> std::result::Result<AuthenticatedBrowser, Box<Response>> {
-    authenticate_browser_http_request(state, headers)
+    match authenticate_browser_http_request(state, headers).await {
+        Ok(browser) => Ok(browser),
+        Err(_) => Err(Box::new(Redirect::to("/login").into_response())),
+    }
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -2233,62 +2370,48 @@ mod tests {
         tokens.insert("token".to_string());
         let mut origins = HashSet::new();
         origins.insert("https://relay.example.com".to_string());
+        let local_auth = BrowserAuthConfig {
+            login: LocalLoginAuthConfig {
+                username: "admin".to_string(),
+                password: "password".to_string(),
+                session_ttl_secs: 3600,
+                cookie_name: "relay_session".to_string(),
+                cookie_secure: true,
+            },
+            allowed_origins: origins.clone(),
+        };
 
-        let missing_client_token = validate_auth_configuration(
-            bind,
-            false,
-            &HashSet::new(),
-            true,
-            &Some("secret".to_string()),
-            &origins,
-            false,
-        );
+        let missing_client_token =
+            validate_auth_configuration(bind, false, &HashSet::new(), &local_auth);
         assert!(missing_client_token.is_err());
 
-        let missing_browser_secret =
-            validate_auth_configuration(bind, false, &tokens, true, &None, &origins, false);
-        assert!(missing_browser_secret.is_err());
+        let mut no_origin_auth = local_auth.clone();
+        no_origin_auth.allowed_origins = HashSet::new();
+        let missing_origin = validate_auth_configuration(bind, false, &tokens, &no_origin_auth);
+        assert!(missing_origin.is_err());
 
-        let disabled_browser_auth =
-            validate_auth_configuration(bind, false, &tokens, false, &None, &origins, false);
-        assert!(disabled_browser_auth.is_err());
-
-        validate_auth_configuration(
-            bind,
-            false,
-            &tokens,
-            true,
-            &Some("secret".to_string()),
-            &origins,
-            false,
-        )
-        .expect("strict mode with full auth config should pass");
+        validate_auth_configuration(bind, false, &tokens, &local_auth)
+            .expect("strict mode with local login config should pass");
     }
 
     #[test]
     fn insecure_dev_mode_only_allows_loopback_bind() {
         let loopback = "127.0.0.1:8080".parse().expect("valid addr");
-        validate_auth_configuration(
-            loopback,
-            true,
-            &HashSet::new(),
-            false,
-            &None,
-            &HashSet::new(),
-            true,
-        )
-        .expect("insecure dev mode should allow loopback");
+        let local_auth = BrowserAuthConfig {
+            login: LocalLoginAuthConfig {
+                username: "admin".to_string(),
+                password: "password".to_string(),
+                session_ttl_secs: 3600,
+                cookie_name: "relay_session".to_string(),
+                cookie_secure: false,
+            },
+            allowed_origins: HashSet::new(),
+        };
+        validate_auth_configuration(loopback, true, &HashSet::new(), &local_auth)
+            .expect("insecure dev mode should allow loopback");
 
         let non_loopback = "0.0.0.0:8080".parse().expect("valid addr");
-        let result = validate_auth_configuration(
-            non_loopback,
-            true,
-            &HashSet::new(),
-            false,
-            &None,
-            &HashSet::new(),
-            true,
-        );
+        let result = validate_auth_configuration(non_loopback, true, &HashSet::new(), &local_auth);
         assert!(result.is_err());
     }
 
