@@ -1,12 +1,15 @@
 use anyhow::Result;
 use codex_master::config::{AppConfig, RelayTransportConfig, TransportConfig};
 use codex_master::runtime;
+use codex_master::tls;
 use codex_master::transport::{LocalDebugTransport, RelayTransport};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, Instant, sleep};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    tls::install_rustls_ring_provider();
+
     tokio::task::LocalSet::new()
         .run_until(async {
             let config = AppConfig::from_env()?;
