@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=codex
-Group=codex
+User=dev
+Group=dev
 WorkingDirectory=/var/lib/codex-master/relay
 EnvironmentFile=/etc/codex-master/relay.env
 ExecStart=/usr/local/bin/relay_server

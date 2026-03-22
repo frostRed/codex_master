@@ -462,3 +462,36 @@ Status: completed
 - Main risks:
   - ambiguous placeholder paths causing copy-paste deployment mistakes
   - mismatch between env templates and current strict-mode auth requirements
+
+## 2026-03-22 Production Auth Hardening Follow-up
+
+Status: completed
+
+- Goal: harden public-production auth by adding upstream identity passthrough validation, browser origin allowlist checks, and client token rotation/revocation support.
+- Scope:
+  - extend relay-server client auth from single token to token set + revoked token set
+  - remove legacy single-token fallback compatibility so production config has one unambiguous token source
+  - require explicit browser origin allowlist in strict mode and enforce it on browser HTTP/WS requests
+  - make unauthenticated/anonymous browser mode explicitly opt-in and dev-only
+  - update deployment env examples/docs to reflect the new production auth knobs
+- Invariants:
+  - strict mode remains default for production
+  - loopback-only insecure mode remains possible for local debugging
+  - browser/session ownership checks continue to apply after authentication
+  - no protocol shape changes required between relay server and home client/browser
+- Likely files/modules to change:
+  - `PLANS.md`
+  - `src/relay_server.rs`
+  - `deploy/env/relay.env.example`
+  - `docs/caddy-auth.md`
+- Verification steps:
+  - run `cargo fmt`
+  - run `cargo check`
+  - run `cargo test`
+  - run `cargo clippy --all-targets --all-features -- -D warnings`
+  - inspect auth flow for valid token, rotated token, and revoked token behavior
+  - inspect origin allowlist rejections for missing/invalid browser `Origin`
+- Main risks:
+  - over-restricting origin validation and blocking legitimate production domains
+  - misconfigured token lists causing home-client lockout during rotation
+  - introducing auth regressions for local loopback debug mode

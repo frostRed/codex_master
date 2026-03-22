@@ -19,7 +19,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     path::PathBuf,
     sync::{
@@ -35,11 +35,14 @@ use tokio::{
 #[derive(Debug, Clone)]
 pub struct RelayServerConfig {
     pub bind_addr: SocketAddr,
-    pub expected_client_token: Option<String>,
+    pub accepted_client_tokens: HashSet<String>,
+    pub revoked_client_tokens: HashSet<String>,
     pub browser_auth_required: bool,
     pub browser_auth_user_header: String,
     pub browser_auth_proxy_secret: Option<String>,
     pub browser_auth_proxy_secret_header: String,
+    pub browser_allowed_origins: HashSet<String>,
+    pub browser_allow_anonymous: bool,
     pub allow_insecure_dev: bool,
     pub state_file: PathBuf,
     pub compaction_threshold: usize,
@@ -57,7 +60,8 @@ impl RelayServerConfig {
             .map(|value| parse_bool_env("RELAY_SERVER_ALLOW_INSECURE_DEV", &value))
             .transpose()?
             .unwrap_or(false);
-        let expected_client_token = optional_nonempty_env("RELAY_SERVER_CLIENT_TOKEN")?;
+        let accepted_client_tokens = parse_client_token_set()?;
+        let revoked_client_tokens = parse_string_set_env("RELAY_SERVER_CLIENT_TOKENS_REVOKED")?;
         let browser_auth_required = std::env::var("RELAY_SERVER_BROWSER_AUTH_REQUIRED")
             .ok()
             .map(|value| parse_bool_env("RELAY_SERVER_BROWSER_AUTH_REQUIRED", &value))
@@ -70,6 +74,12 @@ impl RelayServerConfig {
         let browser_auth_proxy_secret_header =
             std::env::var("RELAY_SERVER_BROWSER_AUTH_PROXY_SECRET_HEADER")
                 .unwrap_or_else(|_| "X-Relay-Auth-Secret".to_string());
+        let browser_allowed_origins = parse_origin_set_env("RELAY_SERVER_BROWSER_ALLOWED_ORIGINS")?;
+        let browser_allow_anonymous = std::env::var("RELAY_SERVER_BROWSER_ALLOW_ANONYMOUS")
+            .ok()
+            .map(|value| parse_bool_env("RELAY_SERVER_BROWSER_ALLOW_ANONYMOUS", &value))
+            .transpose()?
+            .unwrap_or(false);
         let state_file = std::env::var("RELAY_SERVER_STATE_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("relay-state.json"));
@@ -84,17 +94,22 @@ impl RelayServerConfig {
         validate_auth_configuration(
             bind_addr,
             allow_insecure_dev,
-            &expected_client_token,
+            &accepted_client_tokens,
             browser_auth_required,
             &browser_auth_proxy_secret,
+            &browser_allowed_origins,
+            browser_allow_anonymous,
         )?;
         Ok(Self {
             bind_addr,
-            expected_client_token,
+            accepted_client_tokens,
+            revoked_client_tokens,
             browser_auth_required,
             browser_auth_user_header,
             browser_auth_proxy_secret,
             browser_auth_proxy_secret_header,
+            browser_allowed_origins,
+            browser_allow_anonymous,
             allow_insecure_dev,
             state_file,
             compaction_threshold,
@@ -108,8 +123,14 @@ struct AppState {
     inner: Arc<InnerState>,
 }
 
+#[derive(Debug, Clone)]
+struct ClientAuthConfig {
+    accepted_tokens: HashSet<String>,
+    revoked_tokens: HashSet<String>,
+}
+
 struct InnerState {
-    expected_client_token: Option<String>,
+    client_auth: ClientAuthConfig,
     browser_auth: BrowserAuthConfig,
     persistence: RelayPersistence,
     next_browser_id: AtomicU64,
@@ -155,6 +176,8 @@ struct BrowserAuthConfig {
     user_header: String,
     expected_proxy_secret: Option<String>,
     proxy_secret_header: String,
+    allowed_origins: HashSet<String>,
+    allow_anonymous: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -209,12 +232,17 @@ impl AppState {
         let next_event_counter = persisted.next_event_seq();
         Ok(Self {
             inner: Arc::new(InnerState {
-                expected_client_token: config.expected_client_token,
+                client_auth: ClientAuthConfig {
+                    accepted_tokens: config.accepted_client_tokens,
+                    revoked_tokens: config.revoked_client_tokens,
+                },
                 browser_auth: BrowserAuthConfig {
                     required: config.browser_auth_required,
                     user_header: config.browser_auth_user_header,
                     expected_proxy_secret: config.browser_auth_proxy_secret,
                     proxy_secret_header: config.browser_auth_proxy_secret_header,
+                    allowed_origins: config.browser_allowed_origins,
+                    allow_anonymous: config.browser_allow_anonymous,
                 },
                 persistence,
                 next_browser_id: AtomicU64::new(1),
@@ -395,7 +423,7 @@ async fn browser_ws_handler(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let browser = match authenticate_browser_request(&state, &headers) {
+    let browser = match authenticate_browser_ws_request(&state, &headers) {
         Ok(browser) => browser,
         Err(response) => return *response,
     };
@@ -428,9 +456,8 @@ async fn handle_client_socket(state: AppState, socket: WebSocket) {
         }
     };
 
-    if let Some(expected) = &state.inner.expected_client_token
-        && &auth_token != expected
-    {
+    if !is_client_token_allowed(&state.inner.client_auth, &auth_token) {
+        eprintln!("[relay-auth] reject client `{device_id}` due to invalid/revoked token");
         let _ = tx.send(Message::Close(None));
         writer.abort();
         return;
@@ -1786,13 +1813,81 @@ fn optional_nonempty_env(key: &str) -> Result<Option<String>> {
     }
 }
 
+fn parse_string_set_env(key: &str) -> Result<HashSet<String>> {
+    let Ok(raw) = std::env::var(key) else {
+        return Ok(HashSet::new());
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let values = trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<HashSet<_>>();
+
+    if values.is_empty() {
+        return Err(anyhow!("{key} 至少需要包含一个非空值"));
+    }
+
+    Ok(values)
+}
+
+fn parse_client_token_set() -> Result<HashSet<String>> {
+    parse_string_set_env("RELAY_SERVER_CLIENT_TOKENS")
+}
+
+fn parse_origin_set_env(key: &str) -> Result<HashSet<String>> {
+    let origins = parse_string_set_env(key)?;
+    let mut normalized = HashSet::with_capacity(origins.len());
+    for origin in origins {
+        let normalized_origin =
+            normalize_origin(&origin).ok_or_else(|| anyhow!("{key} 包含非法 origin: {origin}"))?;
+        normalized.insert(normalized_origin);
+    }
+    Ok(normalized)
+}
+
+fn normalize_origin(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    let (scheme, rest) = trimmed.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "https" && scheme != "http" {
+        return None;
+    }
+    if rest.is_empty() || rest.contains('/') || rest.contains('?') || rest.contains('#') {
+        return None;
+    }
+    Some(format!("{scheme}://{}", rest.to_ascii_lowercase()))
+}
+
+fn is_client_token_allowed(auth: &ClientAuthConfig, token: &str) -> bool {
+    if auth.revoked_tokens.contains(token) {
+        return false;
+    }
+    if auth.accepted_tokens.is_empty() {
+        return true;
+    }
+    auth.accepted_tokens.contains(token)
+}
+
 fn validate_auth_configuration(
     bind_addr: SocketAddr,
     allow_insecure_dev: bool,
-    expected_client_token: &Option<String>,
+    accepted_client_tokens: &HashSet<String>,
     browser_auth_required: bool,
     browser_auth_proxy_secret: &Option<String>,
+    browser_allowed_origins: &HashSet<String>,
+    browser_allow_anonymous: bool,
 ) -> Result<()> {
+    if browser_allow_anonymous && browser_auth_required {
+        return Err(anyhow!(
+            "RELAY_SERVER_BROWSER_ALLOW_ANONYMOUS=true 不能和 RELAY_SERVER_BROWSER_AUTH_REQUIRED=true 同时开启"
+        ));
+    }
     if browser_auth_required && browser_auth_proxy_secret.is_none() {
         return Err(anyhow!(
             "开启 RELAY_SERVER_BROWSER_AUTH_REQUIRED 时必须设置 RELAY_SERVER_BROWSER_AUTH_PROXY_SECRET"
@@ -1808,9 +1903,9 @@ fn validate_auth_configuration(
         return Ok(());
     }
 
-    if expected_client_token.is_none() {
+    if accepted_client_tokens.is_empty() {
         return Err(anyhow!(
-            "缺少 RELAY_SERVER_CLIENT_TOKEN；生产模式必须启用 home client token 认证"
+            "缺少 RELAY_SERVER_CLIENT_TOKENS；生产模式必须启用 home client token 认证"
         ));
     }
     if !browser_auth_required {
@@ -1821,6 +1916,16 @@ fn validate_auth_configuration(
     if browser_auth_proxy_secret.is_none() {
         return Err(anyhow!(
             "生产模式必须设置 RELAY_SERVER_BROWSER_AUTH_PROXY_SECRET 以防止伪造浏览器身份头"
+        ));
+    }
+    if browser_allowed_origins.is_empty() {
+        return Err(anyhow!(
+            "生产模式必须设置 RELAY_SERVER_BROWSER_ALLOWED_ORIGINS（逗号分隔）用于浏览器 Origin 校验"
+        ));
+    }
+    if browser_allow_anonymous {
+        return Err(anyhow!(
+            "生产模式不允许 RELAY_SERVER_BROWSER_ALLOW_ANONYMOUS=true"
         ));
     }
 
@@ -1835,15 +1940,47 @@ fn parse_bool_env(key: &str, value: &str) -> Result<bool> {
     }
 }
 
-fn authenticate_browser_request(
+fn authenticate_browser_ws_request(
     state: &AppState,
     headers: &HeaderMap,
 ) -> std::result::Result<AuthenticatedBrowser, Box<Response>> {
+    authenticate_browser_request(state, headers, true)
+}
+
+fn authenticate_browser_http_request(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> std::result::Result<AuthenticatedBrowser, Box<Response>> {
+    authenticate_browser_request(state, headers, false)
+}
+
+fn authenticate_browser_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    enforce_origin: bool,
+) -> std::result::Result<AuthenticatedBrowser, Box<Response>> {
     let auth = &state.inner.browser_auth;
+    if enforce_origin && !auth.allowed_origins.is_empty() {
+        let Some(origin_header) = header_value(headers, "Origin") else {
+            return Err(unauthorized_response("browser origin header missing"));
+        };
+        let Some(origin) = normalize_origin(&origin_header) else {
+            return Err(unauthorized_response("browser origin header invalid"));
+        };
+        if !auth.allowed_origins.contains(&origin) {
+            return Err(unauthorized_response("browser origin not allowed"));
+        }
+    }
+
     if !auth.required {
-        return Ok(AuthenticatedBrowser {
-            user_id: "anonymous".to_string(),
-        });
+        if auth.allow_anonymous {
+            return Ok(AuthenticatedBrowser {
+                user_id: "anonymous".to_string(),
+            });
+        }
+        return Err(unauthorized_response(
+            "browser auth disabled without anonymous mode",
+        ));
     }
 
     if let Some(expected_proxy_secret) = auth.expected_proxy_secret.as_deref() {
@@ -1869,7 +2006,7 @@ fn ensure_browser_http_auth(
     state: &AppState,
     headers: &HeaderMap,
 ) -> std::result::Result<AuthenticatedBrowser, Box<Response>> {
-    authenticate_browser_request(state, headers)
+    authenticate_browser_http_request(state, headers)
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -1921,6 +2058,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn persisted_session(
         session_id: &str,
@@ -2091,25 +2229,38 @@ mod tests {
     #[test]
     fn strict_auth_configuration_requires_tokens_and_browser_guardrails() {
         let bind = "127.0.0.1:8080".parse().expect("valid addr");
+        let mut tokens = HashSet::new();
+        tokens.insert("token".to_string());
+        let mut origins = HashSet::new();
+        origins.insert("https://relay.example.com".to_string());
 
-        let missing_client_token =
-            validate_auth_configuration(bind, false, &None, true, &Some("secret".to_string()));
+        let missing_client_token = validate_auth_configuration(
+            bind,
+            false,
+            &HashSet::new(),
+            true,
+            &Some("secret".to_string()),
+            &origins,
+            false,
+        );
         assert!(missing_client_token.is_err());
 
         let missing_browser_secret =
-            validate_auth_configuration(bind, false, &Some("token".to_string()), true, &None);
+            validate_auth_configuration(bind, false, &tokens, true, &None, &origins, false);
         assert!(missing_browser_secret.is_err());
 
         let disabled_browser_auth =
-            validate_auth_configuration(bind, false, &Some("token".to_string()), false, &None);
+            validate_auth_configuration(bind, false, &tokens, false, &None, &origins, false);
         assert!(disabled_browser_auth.is_err());
 
         validate_auth_configuration(
             bind,
             false,
-            &Some("token".to_string()),
+            &tokens,
             true,
             &Some("secret".to_string()),
+            &origins,
+            false,
         )
         .expect("strict mode with full auth config should pass");
     }
@@ -2117,11 +2268,58 @@ mod tests {
     #[test]
     fn insecure_dev_mode_only_allows_loopback_bind() {
         let loopback = "127.0.0.1:8080".parse().expect("valid addr");
-        validate_auth_configuration(loopback, true, &None, false, &None)
-            .expect("insecure dev mode should allow loopback");
+        validate_auth_configuration(
+            loopback,
+            true,
+            &HashSet::new(),
+            false,
+            &None,
+            &HashSet::new(),
+            true,
+        )
+        .expect("insecure dev mode should allow loopback");
 
         let non_loopback = "0.0.0.0:8080".parse().expect("valid addr");
-        let result = validate_auth_configuration(non_loopback, true, &None, false, &None);
+        let result = validate_auth_configuration(
+            non_loopback,
+            true,
+            &HashSet::new(),
+            false,
+            &None,
+            &HashSet::new(),
+            true,
+        );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn revoked_client_token_is_rejected_even_if_in_allowlist() {
+        let mut accepted = HashSet::new();
+        accepted.insert("token-a".to_string());
+        accepted.insert("token-b".to_string());
+        let mut revoked = HashSet::new();
+        revoked.insert("token-b".to_string());
+        let auth = ClientAuthConfig {
+            accepted_tokens: accepted,
+            revoked_tokens: revoked,
+        };
+
+        assert!(is_client_token_allowed(&auth, "token-a"));
+        assert!(!is_client_token_allowed(&auth, "token-b"));
+        assert!(!is_client_token_allowed(&auth, "unknown"));
+    }
+
+    #[test]
+    fn normalize_origin_requires_scheme_and_host_only() {
+        assert_eq!(
+            normalize_origin("https://Relay.Example.com"),
+            Some("https://relay.example.com".to_string())
+        );
+        assert_eq!(
+            normalize_origin("https://relay.example.com/"),
+            Some("https://relay.example.com".to_string())
+        );
+        assert!(normalize_origin("https://relay.example.com/path").is_none());
+        assert!(normalize_origin("javascript:alert(1)").is_none());
     }
 }
