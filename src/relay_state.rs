@@ -33,6 +33,22 @@ pub struct RelayStore {
 }
 
 impl RelayStore {
+    fn checkpoint_boundary(&self) -> usize {
+        self.checkpointed_event_count.min(self.events.len())
+    }
+
+    pub fn normalize_checkpoint_boundary(&mut self) {
+        self.checkpointed_event_count = self.checkpoint_boundary();
+    }
+
+    pub fn live_events(&self) -> &[SessionEventMessage] {
+        &self.events[self.checkpoint_boundary()..]
+    }
+
+    pub fn events_from(&self, start: usize) -> &[SessionEventMessage] {
+        &self.events[start.min(self.events.len())..]
+    }
+
     pub fn next_session_counter(&self) -> u64 {
         self.sessions
             .keys()
@@ -53,11 +69,12 @@ impl RelayStore {
     }
 
     pub fn snapshot(&self) -> RelaySnapshot {
+        let checkpoint_boundary = self.checkpoint_boundary();
         RelaySnapshot {
             devices: self.devices.clone(),
             sessions: self.sessions.clone(),
             checkpointed_through_seq: self.checkpointed_through_seq,
-            checkpointed_events: self.events[..self.checkpointed_event_count].to_vec(),
+            checkpointed_events: self.events[..checkpoint_boundary].to_vec(),
         }
     }
 
@@ -186,13 +203,14 @@ impl RelayPersistence {
             checkpointed_event_count,
             checkpointed_through_seq,
         };
+        store.normalize_checkpoint_boundary();
 
         for device in store.devices.values_mut() {
             device.connected = false;
         }
 
         if !self.event_log_dir.exists() && self.legacy_event_log_path.exists() {
-            let live_tail = store.events[store.checkpointed_event_count..].to_vec();
+            let live_tail = store.live_events().to_vec();
             rewrite_segmented_event_log(&self.event_log_dir, &live_tail, self.segment_event_limit)?;
         }
 
@@ -393,6 +411,21 @@ pub fn unix_timestamp_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::SessionEventMessage;
+
+    fn sample_event(seq: u64) -> SessionEventMessage {
+        SessionEventMessage {
+            seq,
+            seq_end: None,
+            session_id: format!("relay-session-{seq}"),
+            timestamp: seq,
+            kind: "output_chunk".to_string(),
+            text: Some(format!("chunk-{seq}")),
+            stop_reason: None,
+            request_id: None,
+            options: None,
+        }
+    }
 
     #[test]
     fn legacy_snapshot_deserializes_without_client_session_id() {
@@ -419,5 +452,33 @@ mod tests {
         assert_eq!(session.summary.session_id, "relay-session-1");
         assert_eq!(session.summary.device_id, "device-1");
         assert_eq!(session.client_session_id, None);
+    }
+
+    #[test]
+    fn snapshot_clamps_checkpoint_boundary_when_events_shrink() {
+        let mut store = RelayStore::default();
+        store.events.push(sample_event(1));
+        store.checkpointed_event_count = 10;
+
+        let snapshot = store.snapshot();
+
+        assert_eq!(snapshot.checkpointed_events.len(), 1);
+        assert_eq!(snapshot.checkpointed_events[0].seq, 1);
+    }
+
+    #[test]
+    fn events_from_and_live_events_clamp_out_of_range_indexes() {
+        let mut store = RelayStore::default();
+        store.events.push(sample_event(1));
+        store.events.push(sample_event(2));
+
+        assert_eq!(store.events_from(1).len(), 1);
+        assert!(store.events_from(20).is_empty());
+
+        store.checkpointed_event_count = 99;
+        assert!(store.live_events().is_empty());
+
+        store.normalize_checkpoint_boundary();
+        assert_eq!(store.checkpointed_event_count, 2);
     }
 }

@@ -2284,14 +2284,15 @@ where
         let mut store = state.inner.store.lock().await;
         let prior_event_count = store.events.len();
         mutate(&mut store);
+        store.normalize_checkpoint_boundary();
         let persistence = state.inner.persistence.clone();
 
         if store.live_event_count() >= persistence.compaction_threshold() {
             store.compact_into_checkpoint();
-            let live_tail = store.events[store.checkpointed_event_count..].to_vec();
+            let live_tail = store.live_events().to_vec();
             (store.clone(), Vec::new(), Some(live_tail), persistence)
         } else {
-            let appended_events = store.events[prior_event_count..].to_vec();
+            let appended_events = store.events_from(prior_event_count).to_vec();
             (store.clone(), appended_events, None, persistence)
         }
     };

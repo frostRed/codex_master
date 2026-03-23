@@ -552,3 +552,28 @@ Status: completed
 - Main risks:
   - adding noisy logs that obscure important signals
   - accidentally logging secrets while adding auth-related context
+
+## 2026-03-23 Relay Event Slice Panic Guard
+
+Status: completed
+
+- Goal: prevent relay-server crashes when websocket disconnect/reconnect flows mutate persisted event history and previously captured indexes become stale.
+- Scope:
+  - harden `update_store` event extraction against shrinking `store.events`
+  - harden `RelayStore` snapshot/tail slicing to avoid out-of-bounds panics when checkpoint metadata exceeds event length
+  - add regression tests for index-clamping behavior
+- Invariants:
+  - keep persistence semantics unchanged (append when not compacting, rewrite when compacting)
+  - preserve existing event ordering and compaction output
+  - avoid introducing silent data loss beyond dropping impossible out-of-range prefixes
+- Likely files/modules to change:
+  - `PLANS.md`
+  - `src/relay_server.rs`
+  - `src/relay_state.rs`
+- Verification steps:
+  - run `cargo fmt`
+  - run `cargo test`
+  - run `cargo check`
+- Main risks:
+  - masking deeper bookkeeping bugs if clamping is overused without targeted tests
+  - accidentally changing persisted tail content during compaction
