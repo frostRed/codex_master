@@ -640,7 +640,10 @@ async fn handle_client_socket(state: AppState, socket: WebSocket) {
                 match serde_json::from_str::<ClientToServerMessage>(text.as_ref()) {
                     Ok(message) => {
                         if let Err(err) = handle_client_message(&state, &device_id, message).await {
-                            eprintln!("[relay-client-message-error] device_id={} err={}", device_id, err);
+                            eprintln!(
+                                "[relay-client-message-error] device_id={} err={}",
+                                device_id, err
+                            );
                         }
                     }
                     Err(err) => {
@@ -665,7 +668,10 @@ async fn handle_client_socket(state: AppState, socket: WebSocket) {
             Ok(Message::Binary(_)) => {}
             Err(err) => {
                 disconnect_reason = format!("ws_error: {err}");
-                eprintln!("[relay-client-ws-error] device_id={} err={}", device_id, err);
+                eprintln!(
+                    "[relay-client-ws-error] device_id={} err={}",
+                    device_id, err
+                );
                 break;
             }
         }
@@ -830,7 +836,6 @@ async fn read_client_hello(
                 ));
             }
             Err(err) => return Err(anyhow!("读取 client hello 失败: {err}")),
-            Ok(Message::Frame(_)) => {}
         }
     }
 
@@ -1752,6 +1757,7 @@ async fn send_to_client(
     device_id: &str,
     message: ServerToClientMessage,
 ) -> Result<()> {
+    let message_kind = server_message_kind(&message);
     let sender = {
         let devices = state.inner.devices.lock().await;
         devices
@@ -1759,9 +1765,17 @@ async fn send_to_client(
             .map(|device| device.sender.clone())
             .ok_or_else(|| anyhow!("device 未连接: {device_id}"))?
     };
-    sender
-        .send(text_message(&message))
-        .map_err(|_| anyhow!("client channel 已关闭"))?;
+    sender.send(text_message(&message)).map_err(|_| {
+        eprintln!(
+            "[relay-send-client-error] device_id={} kind={} err=channel closed",
+            device_id, message_kind
+        );
+        anyhow!("client channel 已关闭")
+    })?;
+    eprintln!(
+        "[relay-send-client] device_id={} kind={}",
+        device_id, message_kind
+    );
     Ok(())
 }
 
@@ -1957,6 +1971,52 @@ fn text_message<T: serde::Serialize>(message: &T) -> Message {
             .to_string(),
         ),
     }
+}
+
+fn client_message_kind(message: &ClientToServerMessage) -> &'static str {
+    match message {
+        ClientToServerMessage::Hello { .. } => "hello",
+        ClientToServerMessage::Ready { .. } => "ready",
+        ClientToServerMessage::Info { .. } => "info",
+        ClientToServerMessage::SessionCreated { .. } => "session_created",
+        ClientToServerMessage::SessionResumed { .. } => "session_resumed",
+        ClientToServerMessage::SessionResumeFailed { .. } => "session_resume_failed",
+        ClientToServerMessage::OutputChunk { .. } => "output_chunk",
+        ClientToServerMessage::PromptFinished { .. } => "prompt_finished",
+        ClientToServerMessage::PermissionRequested { .. } => "permission_requested",
+        ClientToServerMessage::Error { .. } => "error",
+    }
+}
+
+fn server_message_kind(message: &ServerToClientMessage) -> &'static str {
+    match message {
+        ServerToClientMessage::CreateSession { .. } => "create_session",
+        ServerToClientMessage::ResumeSession { .. } => "resume_session",
+        ServerToClientMessage::Prompt { .. } => "prompt",
+        ServerToClientMessage::ResolvePermission { .. } => "resolve_permission",
+        ServerToClientMessage::CancelSession { .. } => "cancel_session",
+        ServerToClientMessage::Ping => "ping",
+        ServerToClientMessage::Shutdown => "shutdown",
+    }
+}
+
+fn close_frame_summary(frame: Option<&axum::extract::ws::CloseFrame>) -> String {
+    match frame {
+        Some(frame) => format!("code={} reason={}", frame.code, frame.reason),
+        None => "none".to_string(),
+    }
+}
+
+fn truncate_for_log(text: &str, max_chars: usize) -> String {
+    let mut truncated = String::new();
+    for (index, ch) in text.chars().enumerate() {
+        if index >= max_chars {
+            truncated.push_str("...");
+            break;
+        }
+        truncated.push(ch);
+    }
+    truncated.replace('\n', "\\n")
 }
 
 fn session_summary_visible_to_user(session: &PersistedRelaySession, browser_user_id: &str) -> bool {

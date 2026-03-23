@@ -184,6 +184,12 @@ pub async fn run_home_client<T: ClientTransport>(
     default_workspace_id: String,
 ) -> Result<()> {
     let codex_acp_bin = std::env::var("CODEX_ACP_BIN").unwrap_or_else(|_| "codex-acp".to_string());
+    eprintln!(
+        "[runtime] starting home client codex_acp_bin={} workspace_count={} default_workspace={}",
+        codex_acp_bin,
+        workspaces.len(),
+        default_workspace_id
+    );
 
     let mut child = Command::new(&codex_acp_bin)
         .stdin(Stdio::piped())
@@ -192,6 +198,7 @@ pub async fn run_home_client<T: ClientTransport>(
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("启动 `{codex_acp_bin}` 失败，请先安装 codex-acp"))?;
+    eprintln!("[runtime] spawned codex-acp pid={:?}", child.id());
 
     let child_stdin = child.stdin.take().context("无法获取 codex-acp stdin")?;
     let child_stdout = child.stdout.take().context("无法获取 codex-acp stdout")?;
@@ -260,6 +267,7 @@ pub async fn run_home_client<T: ClientTransport>(
         tokio::select! {
             maybe_command = transport.next_command() => {
                 let Some(command) = maybe_command else {
+                    eprintln!("[runtime] transport command channel closed; exiting runtime loop");
                     break;
                 };
 
@@ -279,6 +287,7 @@ pub async fn run_home_client<T: ClientTransport>(
             }
             maybe_event = internal_rx.recv() => {
                 let Some(event) = maybe_event else {
+                    eprintln!("[runtime] internal event channel closed; exiting runtime loop");
                     break;
                 };
 
@@ -288,7 +297,8 @@ pub async fn run_home_client<T: ClientTransport>(
     }
 
     let _ = child.start_kill();
-    let _ = child.wait().await;
+    let wait_result = child.wait().await;
+    eprintln!("[runtime] codex-acp child exited status={wait_result:?}");
 
     Ok(())
 }

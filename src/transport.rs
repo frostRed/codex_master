@@ -355,6 +355,7 @@ impl RelayTransport {
         let command_tx_for_reader = command_tx.clone();
         let device_id_for_reader = device_id.clone();
         tokio::task::spawn_local(async move {
+            let mut reader_exit_reason = "stream_ended".to_string();
             eprintln!(
                 "[relay-read] reader loop started device_id={}",
                 device_id_for_reader
@@ -372,6 +373,7 @@ impl RelayTransport {
                                 if let Some(command) = map_server_message(message)
                                     && command_tx_for_reader.send(command).is_err()
                                 {
+                                    reader_exit_reason = "command_channel_closed".to_string();
                                     eprintln!(
                                         "[relay-read] command channel closed; stopping reader device_id={}",
                                         device_id_for_reader
@@ -411,6 +413,8 @@ impl RelayTransport {
                             device_id_for_reader,
                             close_frame_summary(frame.as_ref())
                         );
+                        reader_exit_reason =
+                            format!("close_frame: {}", close_frame_summary(frame.as_ref()));
                         let _ = command_tx_for_reader.send(HomeClientCommand::Exit);
                         break;
                     }
@@ -440,6 +444,7 @@ impl RelayTransport {
                         );
                     }
                     Err(err) => {
+                        reader_exit_reason = format!("read_error: {err}");
                         eprintln!(
                             "[relay-read-error] device_id={} err={}",
                             device_id_for_reader, err
@@ -455,13 +460,14 @@ impl RelayTransport {
                 }
             }
             eprintln!(
-                "[relay-read] reader loop ended device_id={}",
-                device_id_for_reader
+                "[relay-read] reader loop ended device_id={} reason={}",
+                device_id_for_reader, reader_exit_reason
             );
         });
 
         let device_id_for_writer = device_id.clone();
         tokio::task::spawn_local(async move {
+            let mut writer_exit_reason = "outbound_channel_closed".to_string();
             eprintln!(
                 "[relay-write] writer loop started device_id={}",
                 device_id_for_writer
@@ -483,6 +489,7 @@ impl RelayTransport {
                 };
 
                 if let Err(err) = ws_write.send(message).await {
+                    writer_exit_reason = format!("write_error: {err}");
                     eprintln!(
                         "[relay-write-error] device_id={} kind={} err={}",
                         device_id_for_writer, outbound_kind, err
@@ -491,8 +498,8 @@ impl RelayTransport {
                 }
             }
             eprintln!(
-                "[relay-write] writer loop ended device_id={}",
-                device_id_for_writer
+                "[relay-write] writer loop ended device_id={} reason={}",
+                device_id_for_writer, writer_exit_reason
             );
         });
 
@@ -536,9 +543,13 @@ impl ClientTransport for RelayTransport {
 
     async fn publish_event(&mut self, event: HomeClientEvent) -> Result<()> {
         let message = map_home_event(event);
+        let message_kind = client_message_kind(&message);
+        if !matches!(message, ClientToServerMessage::OutputChunk { .. }) {
+            eprintln!("[relay-publish] => {}", message_kind);
+        }
         self.outbound_tx
             .send(RelayOutbound::Protocol(message))
-            .map_err(|_| anyhow!("relay outbound channel 已关闭"))?;
+            .map_err(|_| anyhow!("relay outbound channel 已关闭 (event={message_kind})"))?;
         Ok(())
     }
 }
@@ -700,7 +711,7 @@ fn truncate_for_log(text: &str, max_chars: usize) -> String {
     let mut truncated = String::new();
     for (index, ch) in text.chars().enumerate() {
         if index >= max_chars {
-            truncated.push('…');
+            truncated.push_str("...");
             break;
         }
         truncated.push(ch);

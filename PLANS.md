@@ -529,7 +529,7 @@ Status: completed
 
 ## 2026-03-23 Relay/Home Client Connection Diagnostics
 
-Status: active
+Status: completed
 
 - Goal: improve observability for relay/home-client websocket lifecycle so disconnect causes can be identified from logs without guesswork.
 - Scope:
