@@ -549,6 +549,7 @@ async fn handle_client_socket(state: AppState, socket: WebSocket) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel();
 
+    eprintln!("[relay-client] websocket upgraded; awaiting hello");
     let writer = tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
             if ws_sender.send(message).await.is_err() {
@@ -561,6 +562,7 @@ async fn handle_client_socket(state: AppState, socket: WebSocket) {
     let (device_id, device_name, workspaces, auth_token) = match hello {
         Ok(values) => values,
         Err(err) => {
+            eprintln!("[relay-client-hello-error] {err}");
             let _ = tx.send(text_message(&ServerToBrowserMessage::Error {
                 session_id: None,
                 message: format!("client hello 失败: {err}"),
@@ -569,13 +571,34 @@ async fn handle_client_socket(state: AppState, socket: WebSocket) {
             return;
         }
     };
+    let auth_token_state = if auth_token.trim().is_empty() {
+        "empty"
+    } else {
+        "set"
+    };
+    let auth_token_len = auth_token.chars().count();
 
     if !is_client_token_allowed(&state.inner.client_auth, &auth_token) {
-        eprintln!("[relay-auth] reject client `{device_id}` due to invalid/revoked token");
+        eprintln!(
+            "[relay-auth] reject client `{}` token_state={} token_len={} accepted_token_count={} revoked_token_count={}",
+            device_id,
+            auth_token_state,
+            auth_token_len,
+            state.inner.client_auth.accepted_tokens.len(),
+            state.inner.client_auth.revoked_tokens.len()
+        );
         let _ = tx.send(Message::Close(None));
         writer.abort();
         return;
     }
+    eprintln!(
+        "[relay-client] authenticated device_id={} device_name={} workspace_count={} auth_token={} token_len={}",
+        device_id,
+        device_name,
+        workspaces.len(),
+        auth_token_state,
+        auth_token_len
+    );
 
     {
         let mut devices = state.inner.devices.lock().await;
@@ -610,27 +633,47 @@ async fn handle_client_socket(state: AppState, socket: WebSocket) {
     )
     .await;
 
+    let mut disconnect_reason = "stream_ended".to_string();
     while let Some(result) = ws_receiver.next().await {
         match result {
             Ok(Message::Text(text)) => {
-                if let Ok(message) = serde_json::from_str::<ClientToServerMessage>(text.as_ref())
-                    && let Err(err) = handle_client_message(&state, &device_id, message).await
-                {
-                    eprintln!("[relay-client-message-error] {err}");
+                match serde_json::from_str::<ClientToServerMessage>(text.as_ref()) {
+                    Ok(message) => {
+                        if let Err(err) = handle_client_message(&state, &device_id, message).await {
+                            eprintln!("[relay-client-message-error] device_id={} err={}", device_id, err);
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[relay-client-parse-error] device_id={} err={} payload_len={} payload_preview={}",
+                            device_id,
+                            err,
+                            text.len(),
+                            truncate_for_log(text.as_ref(), 160)
+                        );
+                    }
                 }
             }
-            Ok(Message::Close(_)) => break,
+            Ok(Message::Close(frame)) => {
+                disconnect_reason = format!("close_frame: {}", close_frame_summary(frame.as_ref()));
+                break;
+            }
             Ok(Message::Ping(payload)) => {
                 let _ = tx.send(Message::Pong(payload));
             }
             Ok(Message::Pong(_)) => {}
             Ok(Message::Binary(_)) => {}
             Err(err) => {
-                eprintln!("[relay-client-ws-error] {err}");
+                disconnect_reason = format!("ws_error: {err}");
+                eprintln!("[relay-client-ws-error] device_id={} err={}", device_id, err);
                 break;
             }
         }
     }
+    eprintln!(
+        "[relay-client] disconnect device_id={} reason={}",
+        device_id, disconnect_reason
+    );
 
     {
         let mut devices = state.inner.devices.lock().await;
@@ -768,12 +811,26 @@ async fn read_client_hello(
                     return Ok((device_id, device_name, workspaces, auth_token));
                 }
 
-                return Err(anyhow!("client 第一个消息必须是 hello"));
+                return Err(anyhow!(
+                    "client 第一个消息必须是 hello，收到 {}",
+                    client_message_kind(&message)
+                ));
             }
             Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
-            Ok(Message::Close(_)) => return Err(anyhow!("client 在 hello 前断开连接")),
-            Ok(Message::Binary(_)) => return Err(anyhow!("client hello 不支持 binary 消息")),
+            Ok(Message::Close(frame)) => {
+                return Err(anyhow!(
+                    "client 在 hello 前断开连接 ({})",
+                    close_frame_summary(frame.as_ref())
+                ));
+            }
+            Ok(Message::Binary(payload)) => {
+                return Err(anyhow!(
+                    "client hello 不支持 binary 消息 (bytes={})",
+                    payload.len()
+                ));
+            }
             Err(err) => return Err(anyhow!("读取 client hello 失败: {err}")),
+            Ok(Message::Frame(_)) => {}
         }
     }
 

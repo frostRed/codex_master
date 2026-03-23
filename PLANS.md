@@ -526,3 +526,29 @@ Status: completed
 - Main risks:
   - accidentally breaking existing deployments that still set proxy-header env vars
   - introducing login regressions around cookie handling or session expiry
+
+## 2026-03-23 Relay/Home Client Connection Diagnostics
+
+Status: active
+
+- Goal: improve observability for relay/home-client websocket lifecycle so disconnect causes can be identified from logs without guesswork.
+- Scope:
+  - add explicit lifecycle logs on home-client relay transport: connect attempt, connect success, hello send, close frame, read/write failures, and reader/writer task exit reasons
+  - add explicit lifecycle logs on relay-server client websocket handling: hello failures, auth decision context, malformed client messages, close frames, and disconnect summary
+  - keep protocol behavior unchanged; this is diagnostics-only
+- Invariants:
+  - do not log sensitive token values in plain text
+  - do not change existing auth/session semantics
+  - preserve current reconnect/backoff behavior
+- Likely files/modules to change:
+  - `PLANS.md`
+  - `src/transport.rs`
+  - `src/main.rs`
+  - `src/relay_server.rs`
+- Verification steps:
+  - run `cargo fmt`
+  - run `cargo check`
+  - inspect new logs for connect/close/error paths to ensure they include enough context (device_id/url/reason) and no token leakage
+- Main risks:
+  - adding noisy logs that obscure important signals
+  - accidentally logging secrets while adding auth-related context

@@ -314,9 +314,38 @@ impl RelayTransport {
         config: RelayTransportConfig,
         workspaces: Vec<WorkspaceConfig>,
     ) -> Result<Self> {
-        let (ws_stream, _) = connect_async(&config.url)
+        let relay_url = config.url.clone();
+        let device_id = config.device_id.clone();
+        let device_name = config.device_name.clone();
+        let auth_token_is_empty = config.auth_token.trim().is_empty();
+        let auth_token_len = config.auth_token.chars().count();
+        let workspace_summaries = workspaces
+            .into_iter()
+            .map(|workspace| WorkspaceSummaryMessage {
+                workspace_id: workspace.id,
+                workspace_name: workspace.name,
+            })
+            .collect::<Vec<_>>();
+
+        eprintln!(
+            "[relay-connect] dialing url={} device_id={} device_name={} workspace_count={} auth_token={} token_len={}",
+            relay_url,
+            device_id,
+            device_name,
+            workspace_summaries.len(),
+            if auth_token_is_empty { "empty" } else { "set" },
+            auth_token_len
+        );
+
+        let (ws_stream, response) = connect_async(&relay_url)
             .await
-            .with_context(|| format!("连接 relay 失败: {}", config.url))?;
+            .with_context(|| format!("连接 relay 失败: {relay_url}"))?;
+        eprintln!(
+            "[relay-connect] websocket connected status={} url={} device_id={}",
+            response.status(),
+            relay_url,
+            device_id
+        );
         let (mut ws_write, mut ws_read) = ws_stream.split();
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -324,19 +353,41 @@ impl RelayTransport {
 
         let outbound_for_reader = outbound_tx.clone();
         let command_tx_for_reader = command_tx.clone();
+        let device_id_for_reader = device_id.clone();
         tokio::task::spawn_local(async move {
+            eprintln!(
+                "[relay-read] reader loop started device_id={}",
+                device_id_for_reader
+            );
             while let Some(message_result) = ws_read.next().await {
                 match message_result {
                     Ok(Message::Text(text)) => {
                         match serde_json::from_str::<ServerToClientMessage>(text.as_ref()) {
                             Ok(message) => {
+                                let message_kind = server_message_kind(&message);
+                                eprintln!(
+                                    "[relay-read] <= {} device_id={}",
+                                    message_kind, device_id_for_reader
+                                );
                                 if let Some(command) = map_server_message(message)
                                     && command_tx_for_reader.send(command).is_err()
                                 {
+                                    eprintln!(
+                                        "[relay-read] command channel closed; stopping reader device_id={}",
+                                        device_id_for_reader
+                                    );
                                     break;
                                 }
                             }
                             Err(err) => {
+                                let preview = truncate_for_log(text.as_ref(), 160);
+                                eprintln!(
+                                    "[relay-read-parse-error] device_id={} err={} payload_len={} payload_preview={}",
+                                    device_id_for_reader,
+                                    err,
+                                    text.len(),
+                                    preview
+                                );
                                 let _ = outbound_for_reader.send(RelayOutbound::Protocol(
                                     ClientToServerMessage::Error {
                                         message: format!("无法解析 server 消息: {err}"),
@@ -346,14 +397,28 @@ impl RelayTransport {
                         }
                     }
                     Ok(Message::Ping(payload)) => {
+                        eprintln!(
+                            "[relay-read] ping received device_id={} payload_bytes={}",
+                            device_id_for_reader,
+                            payload.len()
+                        );
                         let _ =
                             outbound_for_reader.send(RelayOutbound::Raw(Message::Pong(payload)));
                     }
-                    Ok(Message::Close(_)) => {
+                    Ok(Message::Close(frame)) => {
+                        eprintln!(
+                            "[relay-read] close frame received device_id={} detail={}",
+                            device_id_for_reader,
+                            close_frame_summary(frame.as_ref())
+                        );
                         let _ = command_tx_for_reader.send(HomeClientCommand::Exit);
                         break;
                     }
                     Ok(Message::Binary(_)) => {
+                        eprintln!(
+                            "[relay-read] unexpected binary message device_id={}",
+                            device_id_for_reader
+                        );
                         let _ = outbound_for_reader.send(RelayOutbound::Protocol(
                             ClientToServerMessage::Error {
                                 message: "当前 relay transport 不支持 binary websocket 消息"
@@ -361,9 +426,24 @@ impl RelayTransport {
                             },
                         ));
                     }
-                    Ok(Message::Pong(_)) => {}
-                    Ok(Message::Frame(_)) => {}
+                    Ok(Message::Pong(payload)) => {
+                        eprintln!(
+                            "[relay-read] pong received device_id={} payload_bytes={}",
+                            device_id_for_reader,
+                            payload.len()
+                        );
+                    }
+                    Ok(Message::Frame(_)) => {
+                        eprintln!(
+                            "[relay-read] frame passthrough device_id={}",
+                            device_id_for_reader
+                        );
+                    }
                     Err(err) => {
+                        eprintln!(
+                            "[relay-read-error] device_id={} err={}",
+                            device_id_for_reader, err
+                        );
                         let _ = outbound_for_reader.send(RelayOutbound::Protocol(
                             ClientToServerMessage::Error {
                                 message: format!("relay websocket 读取失败: {err}"),
@@ -374,15 +454,28 @@ impl RelayTransport {
                     }
                 }
             }
+            eprintln!(
+                "[relay-read] reader loop ended device_id={}",
+                device_id_for_reader
+            );
         });
 
+        let device_id_for_writer = device_id.clone();
         tokio::task::spawn_local(async move {
+            eprintln!(
+                "[relay-write] writer loop started device_id={}",
+                device_id_for_writer
+            );
             while let Some(outbound) = outbound_rx.recv().await {
+                let outbound_kind = relay_outbound_kind(&outbound);
                 let message = match outbound {
                     RelayOutbound::Protocol(payload) => match serde_json::to_string(&payload) {
                         Ok(text) => Message::Text(text),
                         Err(err) => {
-                            eprintln!("[relay-serialize-error] {err}");
+                            eprintln!(
+                                "[relay-serialize-error] device_id={} kind={} err={}",
+                                device_id_for_writer, outbound_kind, err
+                            );
                             continue;
                         }
                     },
@@ -390,16 +483,31 @@ impl RelayTransport {
                 };
 
                 if let Err(err) = ws_write.send(message).await {
-                    eprintln!("[relay-write-error] {err}");
+                    eprintln!(
+                        "[relay-write-error] device_id={} kind={} err={}",
+                        device_id_for_writer, outbound_kind, err
+                    );
                     break;
                 }
             }
+            eprintln!(
+                "[relay-write] writer loop ended device_id={}",
+                device_id_for_writer
+            );
         });
 
+        eprintln!(
+            "[relay-connect] queue hello device_id={} device_name={} workspace_count={} auth_token={} token_len={}",
+            device_id,
+            device_name,
+            workspace_summaries.len(),
+            if auth_token_is_empty { "empty" } else { "set" },
+            auth_token_len
+        );
         outbound_tx
             .send(RelayOutbound::Protocol(ClientToServerMessage::Hello {
-                device_id: config.device_id,
-                device_name: config.device_name,
+                device_id,
+                device_name,
                 client_version: env!("CARGO_PKG_VERSION").to_string(),
                 capabilities: vec![
                     "acp".to_string(),
@@ -407,16 +515,11 @@ impl RelayTransport {
                     "prompt-stream".to_string(),
                     "permission-roundtrip".to_string(),
                 ],
-                workspaces: workspaces
-                    .into_iter()
-                    .map(|workspace| WorkspaceSummaryMessage {
-                        workspace_id: workspace.id,
-                        workspace_name: workspace.name,
-                    })
-                    .collect(),
+                workspaces: workspace_summaries,
                 auth_token: config.auth_token,
             }))
             .map_err(|_| anyhow!("relay outbound channel 已关闭"))?;
+        eprintln!("[relay-connect] hello queued successfully");
 
         Ok(Self {
             command_rx,
@@ -541,4 +644,66 @@ fn map_home_event(event: HomeClientEvent) -> ClientToServerMessage {
         },
         HomeClientEvent::Error { message } => ClientToServerMessage::Error { message },
     }
+}
+
+fn relay_outbound_kind(outbound: &RelayOutbound) -> &'static str {
+    match outbound {
+        RelayOutbound::Protocol(message) => client_message_kind(message),
+        RelayOutbound::Raw(message) => match message {
+            Message::Text(_) => "raw_text",
+            Message::Binary(_) => "raw_binary",
+            Message::Ping(_) => "raw_ping",
+            Message::Pong(_) => "raw_pong",
+            Message::Close(_) => "raw_close",
+            Message::Frame(_) => "raw_frame",
+        },
+    }
+}
+
+fn client_message_kind(message: &ClientToServerMessage) -> &'static str {
+    match message {
+        ClientToServerMessage::Hello { .. } => "hello",
+        ClientToServerMessage::Ready { .. } => "ready",
+        ClientToServerMessage::Info { .. } => "info",
+        ClientToServerMessage::SessionCreated { .. } => "session_created",
+        ClientToServerMessage::SessionResumed { .. } => "session_resumed",
+        ClientToServerMessage::SessionResumeFailed { .. } => "session_resume_failed",
+        ClientToServerMessage::OutputChunk { .. } => "output_chunk",
+        ClientToServerMessage::PromptFinished { .. } => "prompt_finished",
+        ClientToServerMessage::PermissionRequested { .. } => "permission_requested",
+        ClientToServerMessage::Error { .. } => "error",
+    }
+}
+
+fn server_message_kind(message: &ServerToClientMessage) -> &'static str {
+    match message {
+        ServerToClientMessage::CreateSession { .. } => "create_session",
+        ServerToClientMessage::ResumeSession { .. } => "resume_session",
+        ServerToClientMessage::Prompt { .. } => "prompt",
+        ServerToClientMessage::ResolvePermission { .. } => "resolve_permission",
+        ServerToClientMessage::CancelSession { .. } => "cancel_session",
+        ServerToClientMessage::Ping => "ping",
+        ServerToClientMessage::Shutdown => "shutdown",
+    }
+}
+
+fn close_frame_summary(
+    frame: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame<'_>>,
+) -> String {
+    match frame {
+        Some(frame) => format!("code={} reason={}", frame.code, frame.reason),
+        None => "none".to_string(),
+    }
+}
+
+fn truncate_for_log(text: &str, max_chars: usize) -> String {
+    let mut truncated = String::new();
+    for (index, ch) in text.chars().enumerate() {
+        if index >= max_chars {
+            truncated.push('…');
+            break;
+        }
+        truncated.push(ch);
+    }
+    truncated.replace('\n', "\\n")
 }

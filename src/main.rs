@@ -21,10 +21,23 @@ async fn main() -> Result<()> {
                     runtime::run_home_client(transport, workspaces, default_workspace_id).await
                 }
                 TransportConfig::Relay(relay_config) => {
+                    eprintln!(
+                        "[relay-runtime] relay mode enabled url={} device_id={} device_name={} workspace_count={} default_workspace={}",
+                        relay_config.url,
+                        relay_config.device_id,
+                        relay_config.device_name,
+                        workspaces.len(),
+                        default_workspace_id
+                    );
                     let reset_after = Duration::from_secs(relay_config.reconnect_reset_after_secs);
                     let mut consecutive_failures: u32 = 0;
                     loop {
                         let cycle_started = Instant::now();
+                        let attempt = consecutive_failures.max(1);
+                        eprintln!(
+                            "[relay-runtime] connect attempt {} url={} device_id={}",
+                            attempt, relay_config.url, relay_config.device_id
+                        );
                         let cycle_failed =
                             match RelayTransport::connect(relay_config.clone(), workspaces.clone())
                                 .await
@@ -37,15 +50,25 @@ async fn main() -> Result<()> {
                                     )
                                     .await
                                     {
-                                        eprintln!("[relay-runtime-error] {err}");
+                                        eprintln!(
+                                            "[relay-runtime-error] run_home_client failed after {:.3}s: {}",
+                                            cycle_started.elapsed().as_secs_f64(),
+                                            err
+                                        );
                                     } else {
-                                        eprintln!("[relay-runtime] connection ended");
+                                        eprintln!(
+                                            "[relay-runtime] connection ended after {:.3}s",
+                                            cycle_started.elapsed().as_secs_f64()
+                                        );
                                     }
 
                                     cycle_started.elapsed() < reset_after
                                 }
                                 Err(err) => {
-                                    eprintln!("[relay-connect-error] {err}");
+                                    eprintln!(
+                                        "[relay-connect-error] attempt {} failed: {}",
+                                        attempt, err
+                                    );
                                     true
                                 }
                             };
