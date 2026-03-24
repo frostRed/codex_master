@@ -203,6 +203,7 @@ pub async fn run_home_client<T: ClientTransport>(
     mut transport: T,
     workspaces: Vec<WorkspaceConfig>,
     default_workspace_id: String,
+    transport_info_message: &'static str,
 ) -> Result<()> {
     let codex_acp_bin = std::env::var("CODEX_ACP_BIN").unwrap_or_else(|_| "codex-acp".to_string());
     eprintln!(
@@ -277,7 +278,7 @@ pub async fn run_home_client<T: ClientTransport>(
         .await?;
     transport
         .publish_event(HomeClientEvent::Info {
-            message: "当前为本地 debug transport；下一步会接入远程 relay transport。".to_string(),
+            message: transport_info_message.to_string(),
         })
         .await?;
 

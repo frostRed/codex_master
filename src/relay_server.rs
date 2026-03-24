@@ -211,6 +211,23 @@ fn session_is_closed(status: &str) -> bool {
     status == "closed"
 }
 
+fn session_should_auto_resume(status: &str) -> bool {
+    !session_is_closed(status) && status != "resume_failed"
+}
+
+const RELAY_CLOSE_REASON_CLIENT_HELLO_INVALID: &str = "relay.protocol.client_hello_invalid";
+const RELAY_CLOSE_REASON_CLIENT_AUTH_REJECTED: &str = "relay.auth.client_token_rejected";
+const RELAY_CLOSE_REASON_BROWSER_JSON_INVALID: &str = "relay.protocol.browser_json_invalid";
+const RELAY_CLOSE_REASON_BROWSER_BINARY_UNSUPPORTED: &str =
+    "relay.protocol.browser_binary_unsupported";
+
+fn relay_close_message(code: u16, reason: &'static str) -> Message {
+    Message::Close(Some(axum::extract::ws::CloseFrame {
+        code,
+        reason: reason.into(),
+    }))
+}
+
 fn delete_session_from_store(
     store: &mut RelayStore,
     session_id: &str,
@@ -563,11 +580,12 @@ async fn handle_client_socket(state: AppState, socket: WebSocket) {
         Ok(values) => values,
         Err(err) => {
             eprintln!("[relay-client-hello-error] {err}");
-            let _ = tx.send(text_message(&ServerToBrowserMessage::Error {
-                session_id: None,
-                message: format!("client hello 失败: {err}"),
-            }));
-            writer.abort();
+            let _ = tx.send(relay_close_message(
+                axum::extract::ws::close_code::PROTOCOL,
+                RELAY_CLOSE_REASON_CLIENT_HELLO_INVALID,
+            ));
+            drop(tx);
+            let _ = writer.await;
             return;
         }
     };
@@ -587,8 +605,12 @@ async fn handle_client_socket(state: AppState, socket: WebSocket) {
             state.inner.client_auth.accepted_tokens.len(),
             state.inner.client_auth.revoked_tokens.len()
         );
-        let _ = tx.send(Message::Close(None));
-        writer.abort();
+        let _ = tx.send(relay_close_message(
+            axum::extract::ws::close_code::POLICY,
+            RELAY_CLOSE_REASON_CLIENT_AUTH_REJECTED,
+        ));
+        drop(tx);
+        let _ = writer.await;
         return;
     }
     eprintln!(
@@ -714,7 +736,8 @@ async fn handle_client_socket(state: AppState, socket: WebSocket) {
         },
     )
     .await;
-    writer.abort();
+    drop(tx);
+    let _ = writer.await;
 }
 
 async fn handle_browser_socket(state: AppState, socket: WebSocket, browser: AuthenticatedBrowser) {
@@ -769,15 +792,18 @@ async fn handle_browser_socket(state: AppState, socket: WebSocket, browser: Auth
                         }
                     }
                     Err(err) => {
-                        let _ = send_to_browser(
-                            &state,
-                            &browser_id,
-                            ServerToBrowserMessage::Error {
-                                session_id: None,
-                                message: format!("无法解析 browser 消息: {err}"),
-                            },
-                        )
-                        .await;
+                        eprintln!(
+                            "[relay-browser-parse-error] browser_id={} err={} payload_len={} payload_preview={}",
+                            browser_id,
+                            err,
+                            text.len(),
+                            truncate_for_log(text.as_ref(), 160)
+                        );
+                        let _ = tx.send(relay_close_message(
+                            axum::extract::ws::close_code::INVALID,
+                            RELAY_CLOSE_REASON_BROWSER_JSON_INVALID,
+                        ));
+                        break;
                     }
                 }
             }
@@ -786,7 +812,18 @@ async fn handle_browser_socket(state: AppState, socket: WebSocket, browser: Auth
                 let _ = tx.send(Message::Pong(payload));
             }
             Ok(Message::Pong(_)) => {}
-            Ok(Message::Binary(_)) => {}
+            Ok(Message::Binary(payload)) => {
+                eprintln!(
+                    "[relay-browser-binary-unsupported] browser_id={} bytes={}",
+                    browser_id,
+                    payload.len()
+                );
+                let _ = tx.send(relay_close_message(
+                    axum::extract::ws::close_code::UNSUPPORTED,
+                    RELAY_CLOSE_REASON_BROWSER_BINARY_UNSUPPORTED,
+                ));
+                break;
+            }
             Err(err) => {
                 eprintln!("[relay-browser-ws-error] {err}");
                 break;
@@ -795,7 +832,8 @@ async fn handle_browser_socket(state: AppState, socket: WebSocket, browser: Auth
     }
 
     cleanup_browser(&state, &browser_id).await;
-    writer.abort();
+    drop(tx);
+    let _ = writer.await;
 }
 
 async fn read_client_hello(
@@ -1519,14 +1557,7 @@ async fn handle_browser_message(
             broadcast_session_delta(state, Some(&previous), None).await?;
         }
         BrowserToServerMessage::Ping => {
-            send_to_browser(
-                state,
-                browser_id,
-                ServerToBrowserMessage::Info {
-                    message: "pong".to_string(),
-                },
-            )
-            .await?;
+            // Browser keepalive pings are handled silently to avoid flooding stream output.
         }
     }
 
@@ -1822,6 +1853,7 @@ fn pending_resume_commands(store: &RelayStore, device_id: &str) -> Vec<ServerToC
         .sessions
         .values()
         .filter(|session| session.summary.device_id == device_id)
+        .filter(|session| session_should_auto_resume(&session.summary.status))
         .filter_map(|session| {
             let client_session_id = session.client_session_id.clone()?;
             let workspace_id = session.summary.workspace_id.clone()?;
@@ -2465,6 +2497,65 @@ mod tests {
                 assert_eq!(session_id, "relay-session-2");
                 assert_eq!(client_session_id, "acp-2");
                 assert_eq!(workspace_id, "ws-b");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_resume_commands_skip_closed_and_resume_failed_sessions() {
+        let mut store = RelayStore::default();
+
+        store.sessions.insert(
+            "relay-session-idle".to_string(),
+            persisted_session(
+                "relay-session-idle",
+                "device-a",
+                Some("ws-a"),
+                Some("acp-a"),
+                10,
+            ),
+        );
+        store.sessions.insert(
+            "relay-session-resume-failed".to_string(),
+            persisted_session(
+                "relay-session-resume-failed",
+                "device-a",
+                Some("ws-b"),
+                Some("acp-b"),
+                11,
+            ),
+        );
+        store.sessions.insert(
+            "relay-session-closed".to_string(),
+            persisted_session(
+                "relay-session-closed",
+                "device-a",
+                Some("ws-c"),
+                Some("acp-c"),
+                12,
+            ),
+        );
+
+        if let Some(session) = store.sessions.get_mut("relay-session-resume-failed") {
+            session.summary.status = "resume_failed".to_string();
+        }
+        if let Some(session) = store.sessions.get_mut("relay-session-closed") {
+            session.summary.status = "closed".to_string();
+        }
+
+        let commands = pending_resume_commands(&store, "device-a");
+
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            ServerToClientMessage::ResumeSession {
+                session_id,
+                client_session_id,
+                workspace_id,
+            } => {
+                assert_eq!(session_id, "relay-session-idle");
+                assert_eq!(client_session_id, "acp-a");
+                assert_eq!(workspace_id, "ws-a");
             }
             other => panic!("unexpected command: {other:?}"),
         }

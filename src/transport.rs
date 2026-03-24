@@ -12,7 +12,10 @@ use std::io::Write as _;
 use std::rc::Rc;
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
+use tokio::time::{Duration, sleep};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+const RELAY_WS_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(25);
 
 #[async_trait(?Send)]
 pub trait ClientTransport {
@@ -501,6 +504,30 @@ impl RelayTransport {
                 "[relay-write] writer loop ended device_id={} reason={}",
                 device_id_for_writer, writer_exit_reason
             );
+        });
+
+        let outbound_for_keepalive = outbound_tx.clone();
+        let device_id_for_keepalive = device_id.clone();
+        tokio::task::spawn_local(async move {
+            eprintln!(
+                "[relay-keepalive] started device_id={} interval_secs={}",
+                device_id_for_keepalive,
+                RELAY_WS_KEEPALIVE_INTERVAL.as_secs()
+            );
+
+            loop {
+                sleep(RELAY_WS_KEEPALIVE_INTERVAL).await;
+                if outbound_for_keepalive
+                    .send(RelayOutbound::Raw(Message::Ping(Default::default())))
+                    .is_err()
+                {
+                    eprintln!(
+                        "[relay-keepalive] stopped device_id={} reason=outbound_channel_closed",
+                        device_id_for_keepalive
+                    );
+                    break;
+                }
+            }
         });
 
         eprintln!(

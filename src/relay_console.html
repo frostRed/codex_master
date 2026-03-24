@@ -402,12 +402,18 @@
         reconnectAttempt: 0,
         reconnectTimer: null,
         manualDisconnect: false,
+        activeOutputLine: null,
+        browserPingTimer: null,
       };
 
       const reconnectPolicy = {
         baseDelayMs: 1000,
         maxDelayMs: 30000,
         jitterMs: 1000,
+      };
+
+      const keepalivePolicy = {
+        browserPingIntervalMs: 25000,
       };
 
       const pwaState = {
@@ -460,11 +466,30 @@
         return `${protocol}//${window.location.host}/ws/browser`;
       }
 
+      function clearStreamOutput() {
+        stream.innerHTML = "";
+        state.activeOutputLine = null;
+      }
+
       function appendOutput(text, className = "") {
+        state.activeOutputLine = null;
         const line = document.createElement("div");
         if (className) line.className = className;
         line.textContent = text;
         stream.appendChild(line);
+        stream.scrollTop = stream.scrollHeight;
+      }
+
+      function appendOutputChunk(text) {
+        if (!text) {
+          return;
+        }
+        if (!state.activeOutputLine) {
+          const line = document.createElement("div");
+          stream.appendChild(line);
+          state.activeOutputLine = line;
+        }
+        state.activeOutputLine.textContent += text;
         stream.scrollTop = stream.scrollHeight;
       }
 
@@ -500,13 +525,82 @@
         }
       }
 
-      function scheduleReconnect() {
+      function stopBrowserKeepalive() {
+        if (state.browserPingTimer !== null) {
+          window.clearInterval(state.browserPingTimer);
+          state.browserPingTimer = null;
+        }
+      }
+
+      function startBrowserKeepalive(socket) {
+        stopBrowserKeepalive();
+        state.browserPingTimer = window.setInterval(() => {
+          if (state.socket !== socket || socket.readyState !== WebSocket.OPEN) {
+            return;
+          }
+          try {
+            socket.send(JSON.stringify({ type: "ping" }));
+          } catch (_error) {
+            // Ignore keepalive send errors; websocket close handler will manage reconnect.
+          }
+        }, keepalivePolicy.browserPingIntervalMs);
+      }
+
+      function normalizeCloseReason(reason) {
+        if (typeof reason !== "string") {
+          return "";
+        }
+        return reason.trim();
+      }
+
+      function inferDisconnectHint(event, hadSocketError) {
+        const reasonRaw = normalizeCloseReason(event.reason);
+        const reason = reasonRaw.toLowerCase();
+        if (reasonRaw.startsWith("relay.")) {
+          return `relay server: ${reasonRaw}`;
+        }
+        if (!navigator.onLine) {
+          return "browser offline";
+        }
+        if (hadSocketError || reason.includes("read_error") || reason.includes("read error")) {
+          return "read error";
+        }
+        if (reason.includes("timeout") || reason.includes("idle")) {
+          return "proxy timeout";
+        }
+        if (event.code === 1006) {
+          return "proxy timeout or network drop";
+        }
+        if (event.code === 1011) {
+          return "relay server error";
+        }
+        if (event.code === 1000) {
+          return "normal close";
+        }
+        return "unknown cause";
+      }
+
+      function describeDisconnect(event, hadSocketError) {
+        const reason = normalizeCloseReason(event.reason);
+        const hint = inferDisconnectHint(event, hadSocketError);
+        return {
+          hint,
+          detail: `code=${event.code} clean=${event.wasClean ? "yes" : "no"} reason=${reason || "(none)"} hint=${hint}`,
+        };
+      }
+
+      function scheduleReconnect(disconnectHint = "") {
         if (state.manualDisconnect || state.reconnectTimer !== null) {
           return;
         }
         state.reconnectAttempt += 1;
         const delayMs = computeReconnectDelayMs(state.reconnectAttempt);
-        setConnectionStatus(`Disconnected (retry in ${(delayMs / 1000).toFixed(1)}s)`);
+        const retryLabel = `retry in ${(delayMs / 1000).toFixed(1)}s`;
+        setConnectionStatus(
+          disconnectHint
+            ? `Disconnected (${disconnectHint}; ${retryLabel})`
+            : `Disconnected (${retryLabel})`
+        );
         state.reconnectTimer = window.setTimeout(() => {
           state.reconnectTimer = null;
           connect();
@@ -917,7 +1011,9 @@
         }
 
         clearReconnectTimer();
+        stopBrowserKeepalive();
         const socket = new WebSocket(url);
+        let socketHadError = false;
         state.socket = socket;
         setConnectionStatus("Connecting...");
 
@@ -926,26 +1022,33 @@
           clearReconnectTimer();
           setConnectionStatus("Connected");
           appendOutput("[browser] connected", "meta");
+          startBrowserKeepalive(socket);
           send({ type: "list_devices" });
           send({ type: "list_sessions" });
         });
 
         socket.addEventListener("error", () => {
-          appendOutput("[browser] websocket error", "error");
+          socketHadError = true;
+          appendOutput("[browser] websocket error (likely read/write path)", "error");
         });
 
-        socket.addEventListener("close", () => {
+        socket.addEventListener("close", (event) => {
           if (state.socket === socket) {
             state.socket = null;
           }
+          stopBrowserKeepalive();
+          const disconnect = describeDisconnect(event, socketHadError);
           if (state.manualDisconnect) {
-            setConnectionStatus("Disconnected");
-            appendOutput("[browser] disconnected", "meta");
+            setConnectionStatus(`Disconnected (${disconnect.detail})`);
+            appendOutput(`[browser] disconnected (${disconnect.detail})`, "meta");
             return;
           }
 
-          appendOutput("[browser] disconnected; retry scheduled", "meta");
-          scheduleReconnect();
+          appendOutput(
+            `[browser] disconnected; ${disconnect.detail}; retry scheduled`,
+            "meta"
+          );
+          scheduleReconnect(disconnect.hint);
         });
 
         socket.addEventListener("message", (event) => {
@@ -993,7 +1096,7 @@
               break;
             case "session_history":
               if (state.lastHistoryBeforeSeq === null) {
-                stream.innerHTML = "";
+                clearStreamOutput();
                 appendOutput(`[history] ${message.session_id}`, "meta");
               }
               for (const event of message.events) {
@@ -1025,7 +1128,7 @@
               );
               break;
             case "output_chunk":
-              appendOutput(message.text);
+              appendOutputChunk(message.text);
               break;
             case "prompt_finished":
               appendOutput(
@@ -1061,6 +1164,7 @@
       disconnectBtn.addEventListener("click", () => {
         state.manualDisconnect = true;
         clearReconnectTimer();
+        stopBrowserKeepalive();
         if (state.socket) {
           state.socket.close();
           state.socket = null;
@@ -1127,7 +1231,7 @@
       });
 
       clearOutputBtn.addEventListener("click", () => {
-        stream.innerHTML = "";
+        clearStreamOutput();
       });
 
       installBtn.addEventListener("click", async () => {

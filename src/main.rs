@@ -18,7 +18,13 @@ async fn main() -> Result<()> {
             match config.transport {
                 TransportConfig::Local => {
                     let transport = LocalDebugTransport::new();
-                    runtime::run_home_client(transport, workspaces, default_workspace_id).await
+                    runtime::run_home_client(
+                        transport,
+                        workspaces,
+                        default_workspace_id,
+                        "当前为本地 debug transport；输入 /help 查看可用命令。",
+                    )
+                    .await
                 }
                 TransportConfig::Relay(relay_config) => {
                     eprintln!(
@@ -47,6 +53,7 @@ async fn main() -> Result<()> {
                                         transport,
                                         workspaces.clone(),
                                         default_workspace_id.clone(),
+                                        "当前为远程 relay transport；会话与消息通过 relay server 转发。",
                                     )
                                     .await
                                     {
