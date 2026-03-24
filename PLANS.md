@@ -239,3 +239,35 @@ Status: completed
   - heartbeat interval too aggressive causing unnecessary traffic
   - over-filtering resume candidates and preventing legitimate resume attempts
   - leaving stale timers running after websocket close
+
+## 2026-03-24 Relay Server Structural Refactor
+
+Status: completed
+
+- Goal: turn the oversized relay server implementation into a clearer, more maintainable module layout without changing relay/browser/client behavior.
+- Scope:
+  - split `src/relay_server.rs` by stable responsibility so auth/login handling, HTTP asset handlers, and relay session routing are no longer interleaved in one file
+  - centralize repeated relay-session status/event mutation helpers where it meaningfully reduces duplication
+  - split client-facing and browser-facing message handlers into direction-specific modules
+  - extract the shared connection/broadcast layer so socket send/broadcast/cleanup helpers no longer live in the main module
+  - keep protocol/message shapes, persistence format, and websocket route behavior backward-compatible
+- Invariants:
+  - `relay_server::run` and `RelayServerConfig::from_env` remain the public entry points
+  - browser login/cookie/origin enforcement behavior stays unchanged
+  - client/browser websocket message routing semantics stay unchanged
+  - persisted relay snapshots and event log files remain compatible with existing deployments
+- Likely files/modules to change:
+  - `PLANS.md`
+  - `src/lib.rs`
+  - `src/relay_server.rs` or `src/relay_server/mod.rs`
+  - new `src/relay_server/*.rs` helper modules
+- Verification steps:
+  - run `cargo fmt`
+  - run `cargo check`
+  - run `cargo test`
+  - run `cargo clippy --all-targets --all-features -- -D warnings`
+  - sanity-check that login routes, websocket routes, and session broadcast flows still compile against unchanged protocol types
+- Main risks:
+  - moving private types/functions across modules and accidentally widening or breaking visibility boundaries
+  - introducing subtle behavior drift in auth redirects or websocket cleanup paths during extraction
+  - over-fragmenting the relay server into too many tiny files instead of a few coherent modules
