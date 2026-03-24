@@ -117,6 +117,10 @@
         gap: 18px;
       }
 
+      .grid > * {
+        min-width: 0;
+      }
+
       .card {
         background: var(--panel);
         backdrop-filter: blur(18px);
@@ -128,6 +132,7 @@
       .stack {
         display: grid;
         gap: 18px;
+        min-width: 0;
       }
 
       .card h2 {
@@ -206,6 +211,7 @@
 
       .row > * {
         flex: 1;
+        min-width: 0;
       }
 
       .device-list,
@@ -255,6 +261,8 @@
         color: #edf6ef;
         overflow: auto;
         white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        word-break: break-word;
         font-family: "SF Mono", ui-monospace, Menlo, monospace;
         line-height: 1.45;
       }
