@@ -1008,6 +1008,9 @@ async fn handle_client_message(
             }
         }
         ClientToServerMessage::OutputChunk { session_id, text } => {
+            let session_id = resolve_client_session_alias(state, device_id, &session_id)
+                .await
+                .ok_or_else(|| anyhow!("未知 relay session: {session_id}"))?;
             let now = unix_timestamp_secs();
             let seq = state.next_event_seq();
             let session_id_for_store = session_id.clone();
@@ -1044,6 +1047,9 @@ async fn handle_client_message(
             session_id,
             stop_reason,
         } => {
+            let session_id = resolve_client_session_alias(state, device_id, &session_id)
+                .await
+                .ok_or_else(|| anyhow!("未知 relay session: {session_id}"))?;
             let now = unix_timestamp_secs();
             let seq = state.next_event_seq();
             let session_id_for_store = session_id.clone();
@@ -1083,6 +1089,13 @@ async fn handle_client_message(
             session_id,
             options,
         } => {
+            let session_id = if let Some(session_id) = session_id {
+                resolve_client_session_alias(state, device_id, &session_id)
+                    .await
+                    .or(Some(session_id))
+            } else {
+                None
+            };
             let browser_id = match session_id.as_ref() {
                 Some(session_id) => {
                     let session = {
@@ -1154,6 +1167,31 @@ async fn handle_client_message(
     }
 
     Ok(())
+}
+
+async fn resolve_client_session_alias(
+    state: &AppState,
+    device_id: &str,
+    incoming_session_id: &str,
+) -> Option<String> {
+    let sessions = state.inner.sessions.lock().await;
+    resolve_client_session_alias_in_map(&sessions, device_id, incoming_session_id)
+}
+
+fn resolve_client_session_alias_in_map(
+    sessions: &HashMap<String, RelaySession>,
+    device_id: &str,
+    incoming_session_id: &str,
+) -> Option<String> {
+    if sessions.contains_key(incoming_session_id) {
+        return Some(incoming_session_id.to_string());
+    }
+
+    sessions.iter().find_map(|(relay_session_id, session)| {
+        (session.device_id == device_id
+            && session.client_session_id.as_deref() == Some(incoming_session_id))
+        .then(|| relay_session_id.clone())
+    })
 }
 
 async fn handle_browser_message(
@@ -2430,6 +2468,44 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_client_session_alias_maps_acp_id_for_same_device() {
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "relay-session-1".to_string(),
+            RelaySession {
+                session_id: "relay-session-1".to_string(),
+                device_id: "device-a".to_string(),
+                browser_id: "browser-1".to_string(),
+                owner_user_id: "alice".to_string(),
+                client_session_id: Some("acp-1".to_string()),
+            },
+        );
+
+        let resolved = resolve_client_session_alias_in_map(&sessions, "device-a", "acp-1");
+
+        assert_eq!(resolved.as_deref(), Some("relay-session-1"));
+    }
+
+    #[test]
+    fn resolve_client_session_alias_does_not_cross_devices() {
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "relay-session-1".to_string(),
+            RelaySession {
+                session_id: "relay-session-1".to_string(),
+                device_id: "device-a".to_string(),
+                browser_id: "browser-1".to_string(),
+                owner_user_id: "alice".to_string(),
+                client_session_id: Some("acp-1".to_string()),
+            },
+        );
+
+        let resolved = resolve_client_session_alias_in_map(&sessions, "device-b", "acp-1");
+
+        assert!(resolved.is_none());
     }
 
     #[test]

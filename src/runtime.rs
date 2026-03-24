@@ -43,6 +43,7 @@ enum InternalEvent {
 
 struct RuntimeClientState {
     active_prompt_session: Option<String>,
+    relay_session_by_client_session: HashMap<String, String>,
     next_permission_request_id: u64,
     pending_permissions: HashMap<String, oneshot::Sender<usize>>,
     internal_tx: mpsc::UnboundedSender<InternalEvent>,
@@ -68,6 +69,7 @@ impl RuntimeClient {
         Self {
             state: Rc::new(RefCell::new(RuntimeClientState {
                 active_prompt_session: None,
+                relay_session_by_client_session: HashMap::new(),
                 next_permission_request_id: 1,
                 pending_permissions: HashMap::new(),
                 internal_tx,
@@ -81,6 +83,23 @@ impl RuntimeClient {
 
     fn end_prompt(&self) {
         self.state.borrow_mut().active_prompt_session = None;
+    }
+
+    fn bind_session(&self, relay_session_id: &str, client_session_id: &str) {
+        self.state
+            .borrow_mut()
+            .relay_session_by_client_session
+            .insert(client_session_id.to_string(), relay_session_id.to_string());
+    }
+
+    fn resolve_relay_session_id(&self, client_session_id: &str) -> String {
+        let state = self.state.borrow();
+        state
+            .relay_session_by_client_session
+            .get(client_session_id)
+            .cloned()
+            .or_else(|| state.active_prompt_session.clone())
+            .unwrap_or_else(|| client_session_id.to_string())
     }
 
     fn resolve_permission(&self, request_id: &str, selected_index: usize) -> bool {
@@ -164,12 +183,14 @@ impl Client for RuntimeClient {
         if let SessionUpdate::AgentMessageChunk(chunk) = args.update
             && let ContentBlock::Text(text) = chunk.content
         {
+            let client_session_id = args.session_id.to_string();
+            let relay_session_id = self.resolve_relay_session_id(&client_session_id);
             let _ = self
                 .state
                 .borrow()
                 .internal_tx
                 .send(InternalEvent::OutputChunk {
-                    session_id: args.session_id.to_string(),
+                    session_id: relay_session_id,
                     text: text.text,
                 });
         }
@@ -323,6 +344,9 @@ async fn handle_command<T: ClientTransport>(
             context
                 .sessions
                 .insert(session_ref.clone(), acp_session_id.clone());
+            context
+                .runtime_client
+                .bind_session(&session_ref, &acp_session_id.to_string());
             transport
                 .publish_event(HomeClientEvent::SessionCreated {
                     session_id: session_ref,
@@ -341,6 +365,9 @@ async fn handle_command<T: ClientTransport>(
             let workspace = resolve_workspace(context.workspaces, Some(&workspace_id), None)?;
             match resume_session(context.agent.as_ref(), workspace, &client_session_id).await {
                 Ok(acp_session_id) => {
+                    context
+                        .runtime_client
+                        .bind_session(&session_id, &acp_session_id.to_string());
                     context.sessions.insert(session_id.clone(), acp_session_id);
                     transport
                         .publish_event(HomeClientEvent::SessionResumed {
@@ -389,6 +416,9 @@ async fn handle_command<T: ClientTransport>(
                 Some(session) => session,
                 None => return Ok(true),
             };
+            context
+                .runtime_client
+                .bind_session(&session_ref, &session_id.to_string());
 
             *context.prompt_in_flight = true;
             context.runtime_client.begin_prompt(&session_ref);
@@ -620,4 +650,44 @@ fn resolve_workspace<'a>(
     workspaces
         .first()
         .context("当前没有可用工作区，无法创建会话")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeClient;
+    use tokio::sync::mpsc;
+
+    fn test_runtime_client() -> RuntimeClient {
+        let (internal_tx, _internal_rx) = mpsc::unbounded_channel();
+        RuntimeClient::new(internal_tx)
+    }
+
+    #[test]
+    fn resolve_relay_session_prefers_explicit_binding() {
+        let client = test_runtime_client();
+        client.bind_session("relay-session-9", "019d1ebd-9148-7792-b3ef-dd1b9fd4dc60");
+
+        let resolved = client.resolve_relay_session_id("019d1ebd-9148-7792-b3ef-dd1b9fd4dc60");
+
+        assert_eq!(resolved, "relay-session-9");
+    }
+
+    #[test]
+    fn resolve_relay_session_falls_back_to_active_prompt_session() {
+        let client = test_runtime_client();
+        client.begin_prompt("relay-session-11");
+
+        let resolved = client.resolve_relay_session_id("acp-session-unmapped");
+
+        assert_eq!(resolved, "relay-session-11");
+    }
+
+    #[test]
+    fn resolve_relay_session_uses_client_session_when_unmapped_and_idle() {
+        let client = test_runtime_client();
+
+        let resolved = client.resolve_relay_session_id("acp-session-unmapped");
+
+        assert_eq!(resolved, "acp-session-unmapped");
+    }
 }
